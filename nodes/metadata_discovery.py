@@ -16,7 +16,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph
 
 from state import Stage01State
-from utilis.db import ai_store_db_writer
+from utilis.db import ai_store_db_writer, get_client_connection
 from utilis.logger import logger
 
 
@@ -91,36 +91,10 @@ def _resolve_tables_for_discovery(state: Stage01State) -> List[NominatedTable]:
     return resolved
 
 
-def _build_connection_string(database_name: str) -> str:
-    driver = os.environ.get("AZURE_SQL_DRIVER", "ODBC Driver 18 for SQL Server")
-    host = os.environ.get("AZURE_SQL_SOURCE_HOST") or os.environ.get("AZURE_SQL_HOST", "")
-    port = os.environ.get("AZURE_SQL_PORT", "1433")
-    username = os.environ.get("AZURE_SQL_SOURCE_USERNAME") or os.environ.get("AZURE_SQL_USERNAME", "")
-    password = os.environ.get("AZURE_SQL_SOURCE_PASSWORD") or os.environ.get("AZURE_SQL_PASSWORD", "")
-
-    if not host:
-        raise ValueError("Missing Azure SQL host. Set AZURE_SQL_SOURCE_HOST or AZURE_SQL_HOST.")
-    if not username:
-        raise ValueError("Missing Azure SQL username. Set AZURE_SQL_SOURCE_USERNAME or AZURE_SQL_USERNAME.")
-    if not password:
-        raise ValueError("Missing Azure SQL password. Set AZURE_SQL_SOURCE_PASSWORD or AZURE_SQL_PASSWORD.")
-
-    return (
-        f"DRIVER={{{driver}}};"
-        f"SERVER=tcp:{host},{port};"
-        f"DATABASE={database_name};"
-        f"UID={username};"
-        f"PWD={password};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
-    )
-
-
 def get_azure_sql_connection(database_name: str) -> pyodbc.Connection:
-    return pyodbc.connect(_build_connection_string(database_name))
+    return get_client_connection(database_name)
 
-
+#normalize raw sql data types to more user-friendly formats, e.g. varchar(255) instead of just varchar
 def _format_data_type(
     data_type: str,
     character_maximum_length: Optional[int],
@@ -212,7 +186,7 @@ def _close_connections(connections: Iterable[pyodbc.Connection]) -> None:
         except Exception:
             logger.warning("Azure SQL connection close failed", extra={"node": "metadata_discovery"})
 
-
+#payload generation for metadata discovery and hitl certification nodes
 def _persist_discovered_metadata(
     *,
     run_id: str,
@@ -284,6 +258,11 @@ def metadata_discovery_node(state: Stage01State) -> Stage01State:
                     connections[database_name] = connection
 
                 columns = _fetch_table_columns(connection.cursor(), schema_name, table_name)
+                if not columns:
+                    raise ValueError(
+                        f"No column metadata found for {database_name}.{schema_name}.{table_name}. "
+                        "Table may not exist, schema may be wrong, or access may be blocked."
+                    )
 
                 tables_metadata.append(
                     {
@@ -357,14 +336,27 @@ def metadata_discovery_node(state: Stage01State) -> Stage01State:
         )
         return new_state
 
+    success_count = sum(1 for table in tables_metadata if table["table_status"] == "COMPLETED")
+    failed_count = sum(1 for table in tables_metadata if table["table_status"] == "FAILED")
+
+    if success_count == 0 and failed_count > 0:
+        metadata_status = "FAILED"
+        metadata_error = "Metadata discovery failed for all selected tables."
+    elif failed_count > 0:
+        metadata_status = "COMPLETED_WITH_WARNINGS"
+        metadata_error = f"Metadata discovery failed for {failed_count} table(s)."
+    else:
+        metadata_status = "COMPLETED"
+        metadata_error = None
+
     new_state.update(
         {
             "discovered_metadata": {
                 "certified_kpis": certified_kpis,
                 "tables": tables_metadata,
             },
-            "metadata_status": "COMPLETED",
-            "metadata_error": None,
+            "metadata_status": metadata_status,
+            "metadata_error": metadata_error,
         }
     )
 

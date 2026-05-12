@@ -1,0 +1,503 @@
+{% extends "base.html" %}
+{% block content %}
+{% set artifact_count = summary|length %}
+{% set gate1_count = completed_gate1|length %}
+{% set nomination_count = nominated_tables|length %}
+{% set gate2_count = certified_tables|length %}
+
+<div class="page-stack">
+  <section class="card">
+    <div class="page-title">
+      <div class="title-block">
+        <h1>Run <span class="mono">{{ run_id }}</span></h1>
+        {% if resume_message %}
+          <p class="muted">{{ resume_message }}</p>
+        {% endif %}
+      </div>
+      <div class="badge-row">
+        <span class="badge {% if status == 'FAILED' %}bad{% elif 'PROCESS' in status or current_pipeline_step %}warn{% else %}brand{% endif %}">
+          <span class="dot-sm"></span>Status: {{ status }}
+        </span>
+        {% if current_pipeline_step %}
+          <span class="badge warn">Current: {{ current_pipeline_step.label }}</span>
+        {% endif %}
+        <span class="badge">Next Gate: {{ next_gate or "None" }}</span>
+      </div>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric">
+        <span class="metric-label">Artifacts</span>
+        <span class="metric-value">{{ artifact_count }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Certified KPIs</span>
+        <span class="metric-value">{{ gate1_count }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Nominated Tables</span>
+        <span class="metric-value">{{ nomination_count }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Certified Tables</span>
+        <span class="metric-value">{{ gate2_count }}</span>
+      </div>
+    </div>
+
+    <div class="badge-row" style="margin-top: 14px;">
+      <span class="badge">Sources: {{ checkpoint.get("source_databases", []) }}</span>
+      {% if checkpoint.get("background_stage") %}
+        <span class="badge warn">Background: {{ checkpoint.get("background_stage") }}</span>
+      {% endif %}
+    </div>
+    {% if checkpoint.get("req_business_objective") %}
+      <p class="muted" style="margin: 14px 0 0;"><strong>Business objective:</strong> {{ checkpoint.get("req_business_objective") }}</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Pipeline Progress</h2>
+      {% if current_pipeline_step %}
+        <span class="badge warn">{{ current_pipeline_step.detail }}</span>
+      {% endif %}
+    </div>
+    <div class="panel-body">
+      {% if pipeline_steps %}
+        {% set selected_step = current_pipeline_step or pipeline_steps[0] %}
+        <div id="pipeline-node-inspector" class="pipeline-inspector">
+          <div class="pipeline-inspector-head">
+            <span id="pipeline-node-title" class="pipeline-inspector-title">{{ selected_step.label }}</span>
+            <span id="pipeline-node-state" class="badge {{ selected_step.state }}">{{ selected_step.state|title }}</span>
+          </div>
+          <p id="pipeline-node-detail" class="pipeline-inspector-detail">{{ selected_step.detail }}</p>
+        </div>
+        <div class="pipeline-steps">
+          {% for step in pipeline_steps %}
+            <div
+              class="pipeline-step {{ step.state }}{% if selected_step.key == step.key %} selected{% endif %}"
+              role="button"
+              tabindex="0"
+              aria-label="{{ step.label }}: {{ step.state }}. {{ step.detail }}"
+              data-node-title="{{ step.label }}"
+              data-node-state="{{ step.state|title }}"
+              data-node-detail="{{ step.detail }}"
+            >
+              <div class="step-head">
+                <span class="dot"></span>
+                <span>{{ step.label }}</span>
+              </div>
+              {% if step.state == "running" %}
+                <p class="step-detail">Running - {{ step.detail }}</p>
+              {% elif step.state == "complete" %}
+                <p class="step-detail">Complete - {{ step.detail }}</p>
+              {% elif step.state == "failed" %}
+                <p class="step-detail">Failed - {{ step.detail }}</p>
+              {% else %}
+                <p class="step-detail">Pending - {{ step.detail }}</p>
+              {% endif %}
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="muted">No pipeline progress is available for this run yet.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if pending_gate1 %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Gate 1 Review</h2>
+      <span class="badge warn">{{ pending_gate1|length }} pending</span>
+    </div>
+    <div class="panel-body">
+      <form
+        method="post"
+        action="{{ url_for('gate1', run_id=run_id) }}"
+        data-show-loader="true"
+        data-loader-title="Gate 1 submitted"
+        data-loader-message="Running KPI certification and table nomination. The page will return when Gate 2 is ready."
+        data-loader-steps="Gate 1 Certification|Table Nomination|Gate 2 Preparation"
+      >
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>KPI</th>
+                <th>Description</th>
+                <th>Confidence</th>
+                <th>Decision</th>
+                <th>Edited Name</th>
+                <th>Edited Description</th>
+                <th>Reject Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in pending_gate1 %}
+                <tr>
+                  <td>{{ item.kpi.get("kpi_name", "-") }}</td>
+                  <td>{{ item.kpi.get("kpi_description", "-") }}</td>
+                  <td class="numeric">{{ item.kpi.get("ai_confidence_score", "-") }}</td>
+                  <td>
+                    <select name="action_{{ item.item_id }}">
+                      <option value="APPROVED">Approve</option>
+                      <option value="EDITED">Edit + Approve</option>
+                      <option value="REJECTED">Reject</option>
+                    </select>
+                  </td>
+                  <td><input type="text" name="name_{{ item.item_id }}" value="{{ item.kpi.get('kpi_name', '') }}" /></td>
+                  <td><textarea class="table-textarea" name="description_{{ item.item_id }}">{{ item.kpi.get("kpi_description", "") }}</textarea></td>
+                  <td><input type="text" name="reason_{{ item.item_id }}" /></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="actions"><button type="submit">Submit Gate 1</button></div>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if nominated_tables and not certified_tables %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Gate 2 Review</h2>
+      <span class="badge warn">{{ nominated_tables|length }} nominated</span>
+    </div>
+    <div class="panel-body">
+      <form
+        method="post"
+        action="{{ url_for('gate2', run_id=run_id) }}"
+        data-show-loader="true"
+        data-loader-title="Gate 2 submitted"
+        data-loader-message="Running table certification, metadata discovery, column profiling, and semantic enrichment. This is the slowest step."
+        data-loader-steps="Gate 2 Certification|Metadata Discovery|Column Profiling|Semantic Enrichment|Gate 3 Preparation"
+      >
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Approve</th>
+                <th>Database</th>
+                <th>Schema</th>
+                <th>Table</th>
+                <th>Score</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for table in nominated_tables %}
+                {% set key = table.get("database_name", "") ~ "." ~ table.get("schema_name", "") ~ "." ~ table.get("table_name", "") %}
+                <tr>
+                  <td><input type="checkbox" name="approved_table" value="{{ key }}" checked /></td>
+                  <td>{{ table.get("database_name", "-") }}</td>
+                  <td>{{ table.get("schema_name", "-") }}</td>
+                  <td><strong>{{ table.get("table_name", "-") }}</strong></td>
+                  <td class="numeric">{{ table.get("confidence_score", "-") }}</td>
+                  <td>{{ table.get("nomination_reason", "-") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="actions"><button type="submit">Submit Gate 2</button></div>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if enriched_metadata and not gate3_approved %}
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Gate 3 Review</h2>
+      <span class="badge warn">{{ enriched_columns|length }} columns</span>
+    </div>
+    <div class="panel-body">
+      <div class="metric-grid">
+        <div class="metric"><span class="metric-label">Certified Tables</span><span class="metric-value">{{ certified_tables|length }}</span></div>
+        <div class="metric"><span class="metric-label">Join Suggestions</span><span class="metric-value">{{ enriched_joins|length }}</span></div>
+        <div class="metric"><span class="metric-label">PII Candidates</span><span class="metric-value">{{ pii_columns|length }}</span></div>
+        <div class="metric"><span class="metric-label">Measures</span><span class="metric-value">{{ measure_columns|length }}</span></div>
+      </div>
+
+      <h4>Semantic Type Counts</h4>
+      {% if semantic_counts %}
+        <div class="table-wrap">
+          <table class="table-tight">
+            <tbody>
+              {% for semantic_type, count in semantic_counts.items() %}
+                <tr>
+                  <td>{{ semantic_type }}</td>
+                  <td class="numeric">{{ count }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="muted">No semantic counts available.</p>
+      {% endif %}
+
+      <h4>Column Enrichment Sample</h4>
+      {% if enriched_columns %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Table</th>
+                <th>Column</th>
+                <th>Type</th>
+                <th>Semantic</th>
+                <th>PII</th>
+                <th>Aggregation</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for column in enriched_columns[:30] %}
+                <tr>
+                  <td>{{ column.get("table_name", "-") }}</td>
+                  <td>{{ column.get("column_name", "-") }}</td>
+                  <td>{{ column.get("data_type_full", column.get("data_type", "-")) }}</td>
+                  <td><span class="badge">{{ column.get("semantic_type", "-") }}</span></td>
+                  <td>{{ "Yes" if column.get("is_pii_candidate") or column.get("is_pii") else "No" }}</td>
+                  <td>{{ column.get("suggested_aggregation", "-") }}</td>
+                  <td>{{ column.get("business_description", "-") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="muted">No enriched columns available.</p>
+      {% endif %}
+
+      <h4>Join Suggestions</h4>
+      {% if enriched_joins %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Left Table</th>
+                <th>Left Column</th>
+                <th>Right Table</th>
+                <th>Right Column</th>
+                <th>Join Type</th>
+                <th>Confidence</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for join in enriched_joins[:20] %}
+                <tr>
+                  <td>{{ join.get("left_table", "-") }}</td>
+                  <td>{{ join.get("left_column", "-") }}</td>
+                  <td>{{ join.get("right_table", "-") }}</td>
+                  <td>{{ join.get("right_column", "-") }}</td>
+                  <td>{{ join.get("join_type", "-") }}</td>
+                  <td class="numeric">{{ join.get("confidence", "-") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="muted">No join suggestions found.</p>
+      {% endif %}
+
+      <form
+        method="post"
+        action="{{ url_for('gate3', run_id=run_id) }}"
+        data-show-loader="true"
+        data-loader-title="Gate 3 submitted"
+        data-loader-message="Running enrichment certification, bronze script generation, and silver script generation."
+        data-loader-steps="Gate 3 Certification|Bronze Script Generation|Silver Script Generation|Pipeline Completed"
+      >
+        <div class="actions">
+          <button type="submit" name="decision" value="APPROVED">Approve Gate 3</button>
+          <button class="secondary" type="submit" name="decision" value="REJECTED">Reject Gate 3</button>
+        </div>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+
+  <div class="layout-grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Run Summary</h2>
+        <span class="badge">{{ summary|length }} rows</span>
+      </div>
+      <div class="panel-body">
+        {% if summary %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Stage</th>
+                  <th>Artifact</th>
+                  <th>Faithfulness</th>
+                  <th>Tokens</th>
+                  <th>Stored At</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in summary %}
+                  <tr>
+                    <td>{{ row.stage }}</td>
+                    <td>{{ row.artifact_type }}</td>
+                    <td>{{ row.faithfulness_status or "-" }}</td>
+                    <td class="numeric">{{ row.token_count or 0 }}</td>
+                    <td>{{ row.stored_at }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="muted">No summary rows found.</p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Certified Assets</h2>
+        <span class="badge">{{ gate1_count + gate2_count }} total</span>
+      </div>
+      <div class="panel-body">
+        {% if completed_gate1 %}
+          <h4>Gate 1 KPIs</h4>
+          <div class="table-wrap">
+            <table class="table-tight">
+              <thead>
+                <tr>
+                  <th>KPI</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for item in completed_gate1 %}
+                  <tr>
+                    <td>{{ item.kpi.get("kpi_name", "-") }}</td>
+                    <td><span class="badge good">{{ item.status }}</span></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+
+        {% if certified_tables %}
+          <h4>Gate 2 Tables</h4>
+          <div class="table-wrap">
+            <table class="table-tight">
+              <thead>
+                <tr>
+                  <th>Database</th>
+                  <th>Schema</th>
+                  <th>Table</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for table in certified_tables %}
+                  <tr>
+                    <td>{{ table.get("database_name", "-") }}</td>
+                    <td>{{ table.get("schema_name", "-") }}</td>
+                    <td>{{ table.get("table_name", "-") }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+
+        {% if not completed_gate1 and not certified_tables %}
+          <p class="muted">No certified assets yet.</p>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Bronze Scripts</h2>
+      {% if certified_tables or gate3_approved or bronze_generation_completed %}
+        <form
+          method="post"
+          action="{{ url_for('bronze', run_id=run_id) }}"
+          data-show-loader="true"
+          data-loader-title="Bronze regeneration started"
+          data-loader-message="Regenerating Bronze scripts from Gate 2 certified tables."
+          data-loader-steps="Load Certified Tables|Generate Bronze Scripts|Write Bronze Viewer"
+        >
+          <button type="submit" class="secondary">{{ "Regenerate" if bronze_generation_completed else "Generate" }}</button>
+        </form>
+      {% endif %}
+    </div>
+    <div class="panel-body">
+      {% if gate3_approved or bronze_generation_completed %}
+        {% if bronze.scripts %}
+          {% for script in bronze.scripts %}
+            <div style="margin-bottom: 16px;">
+              <div class="script-head">
+                <p class="script-title">{{ script.database_name }}.{{ script.schema_name }}.{{ script.table }}</p>
+                <span class="badge good">{{ script.status or "APPROVED" }}</span>
+              </div>
+              <pre>{{ script.script_body }}</pre>
+            </div>
+          {% endfor %}
+        {% else %}
+          <p class="muted">No bronze scripts were found for this run.</p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Bronze scripts are not available yet.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Silver Scripts</h2>
+      {% if bronze_generation_completed %}
+        <form
+          method="post"
+          action="{{ url_for('silver', run_id=run_id) }}"
+          data-show-loader="true"
+          data-loader-title="Silver generation started"
+          data-loader-message="Generating Silver scripts from Bronze script metadata and semantic enrichment."
+          data-loader-steps="Load Bronze Bundle|Load Semantic Enrichment|Generate Silver Scripts|Write Silver Viewer"
+        >
+          <button type="submit" class="secondary">{{ "Regenerate" if silver_generation_completed else "Generate" }}</button>
+        </form>
+      {% endif %}
+    </div>
+    <div class="panel-body">
+      {% if silver_generation_completed %}
+        {% if silver.scripts %}
+          {% for script in silver.scripts %}
+            <div style="margin-bottom: 16px;">
+              <div class="script-head">
+                <p class="script-title">{{ script.source_table }} -> {{ script.target_table }}</p>
+                <span class="badge good">{{ script.status or "APPROVED" }}</span>
+              </div>
+              <pre>{{ script.script_body }}</pre>
+            </div>
+          {% endfor %}
+        {% else %}
+          <p class="muted">No silver scripts were found for this run.</p>
+        {% endif %}
+      {% else %}
+        <p class="muted">Silver scripts are not available yet.</p>
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+{% if checkpoint.get("background_stage") %}
+<script>
+  window.setTimeout(function() { window.location.reload(); }, 5000);
+</script>
+{% endif %}
+{% endblock %}

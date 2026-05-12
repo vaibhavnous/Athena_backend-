@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 
 from nodes.ingestion import _chunk_and_embed, finalize_ingestion_after_memory
 from state import Stage01State
-from utilis.db import config, get_pipeline_connection
+from utilis.db import artifact_storage_fingerprint, config, get_pipeline_connection
 from utilis.logger import logger
 
 
@@ -44,15 +44,22 @@ def _fetch_latest_payload(fingerprint: str, artifact_types: Tuple[str, ...]) -> 
     conn = get_pipeline_connection()
     try:
         cursor = conn.cursor()
-        placeholders = ", ".join("?" for _ in artifact_types)
+        pair_conditions = " OR ".join("(fingerprint = ? AND artifact_type = ?)" for _ in artifact_types)
+        legacy_placeholders = ", ".join("?" for _ in artifact_types)
+        params: List[Any] = []
+        for artifact_type in artifact_types:
+            params.extend([artifact_storage_fingerprint(fingerprint, artifact_type), artifact_type])
+        params.extend([fingerprint, *artifact_types])
+
         cursor.execute(
             f"""
             SELECT TOP 1 payload
             FROM [{db_schema}].[ai_store]
-            WHERE fingerprint = ? AND artifact_type IN ({placeholders})
+            WHERE ({pair_conditions})
+               OR (fingerprint = ? AND artifact_type IN ({legacy_placeholders}))
             ORDER BY stored_at DESC
             """,
-            (fingerprint, *artifact_types),
+            tuple(params),
         )
         row = cursor.fetchone()
         if row:
@@ -112,10 +119,12 @@ def _fetch_rejected_kpis(fingerprint: str, limit: int = 10) -> List[str]:
             f"""
             SELECT TOP (?) payload
             FROM [{db_schema}].[ai_store]
-            WHERE fingerprint != ? AND artifact_type = 'KPIS' AND (faithfulness_status = 'FAILED' OR cost_usd = 0)
+            WHERE fingerprint NOT IN (?, ?)
+              AND artifact_type = 'KPIS'
+              AND (faithfulness_status = 'FAILED' OR cost_usd = 0)
             ORDER BY stored_at DESC
             """,
-            (limit, fingerprint),
+            (limit, fingerprint, artifact_storage_fingerprint(fingerprint, "KPIS")),
         )
         for row in cursor.fetchall():
             payload = json.loads(row[0])

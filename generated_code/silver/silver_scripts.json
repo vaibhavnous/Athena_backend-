@@ -1,0 +1,36 @@
+{
+  "generated_at": "2026-05-12T09:06:01.751572",
+  "script_count": 3,
+  "scripts": [
+    {
+      "table": "claim_payment_expenses",
+      "database_name": "insurance",
+      "schema_name": "dbo",
+      "source_table": "bronze.bronze_claim_payment_expenses",
+      "target_table": "silver.silver_claim_payment_expenses",
+      "column_count": 23,
+      "status": "APPROVED",
+      "script_path": "C:\\Users\\vaibhavmalik\\Athena_backend\\generated_code\\silver\\silver_transform_claim_payment_expenses.py"
+    },
+    {
+      "table": "claim_information",
+      "database_name": "insurance",
+      "schema_name": "dbo",
+      "source_table": "bronze.bronze_claim_information",
+      "target_table": "silver.silver_claim_information",
+      "column_count": 15,
+      "status": "APPROVED",
+      "script_path": "C:\\Users\\vaibhavmalik\\Athena_backend\\generated_code\\silver\\silver_transform_claim_information.py"
+    },
+    {
+      "table": "claim_payment_indemnity",
+      "database_name": "insurance",
+      "schema_name": "dbo",
+      "source_table": "bronze.bronze_claim_payment_indemnity",
+      "target_table": "silver.silver_claim_payment_indemnity",
+      "column_count": 23,
+      "status": "APPROVED",
+      "script_path": "C:\\Users\\vaibhavmalik\\Athena_backend\\generated_code\\silver\\silver_transform_claim_payment_indemnity.py"
+    }
+  ]
+}

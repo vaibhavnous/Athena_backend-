@@ -1,9 +1,11 @@
 import os
 import json
 import hashlib
+import time
 import pyodbc
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from utilis.logger import logger
 
@@ -39,6 +41,14 @@ config = {
 }
 
 FINGERPRINT_MAX_LEN = 64
+SQL_CONNECT_RETRIES = max(1, int(os.getenv("ATHENA_SQL_CONNECT_RETRIES", "3")))
+SQL_CONNECT_RETRY_DELAY_SECONDS = float(os.getenv("ATHENA_SQL_CONNECT_RETRY_DELAY_SECONDS", "1"))
+
+
+def artifact_storage_fingerprint(fingerprint: str, artifact_type: str) -> str:
+    """Return the physical ai_store PK for one logical BRD artifact."""
+    raw = f"{fingerprint}:{artifact_type}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -67,6 +77,47 @@ def _build_connection_string(host, port, database_name, username, password, driv
     )
 
 
+def _connect_with_retry(conn_str: str, *, database_name: str) -> pyodbc.Connection:
+    last_exc = None
+    for attempt in range(1, SQL_CONNECT_RETRIES + 1):
+        try:
+            return pyodbc.connect(conn_str)
+        except pyodbc.Error as exc:
+            last_exc = exc
+            if attempt >= SQL_CONNECT_RETRIES:
+                break
+            logger.warning(
+                "SQL connection attempt %d/%d failed for %s: %s",
+                attempt,
+                SQL_CONNECT_RETRIES,
+                database_name,
+                exc,
+            )
+            time.sleep(SQL_CONNECT_RETRY_DELAY_SECONDS * attempt)
+    raise last_exc
+
+
+def build_source_jdbc_url(database_name: Optional[str] = None) -> str:
+    db_conf = config["azure_sql"]
+    db = _normalize_source_db(database_name)
+
+    parts = [
+        f"jdbc:sqlserver://{db_conf['source_host']}:{db_conf['port']};",
+        f"databaseName={db};",
+        "encrypt=true;",
+        "trustServerCertificate=false;",
+    ]
+
+    username = str(db_conf.get("source_username") or "").strip()
+    password = str(db_conf.get("source_password") or "").strip()
+    if username:
+        parts.append(f"user={username};")
+    if password:
+        parts.append(f"password={password}")
+
+    return "".join(parts)
+
+
 # ─────────────────────────────────────────────────────────────
 # PIPELINE DB CONNECTION (WRITE)
 # ─────────────────────────────────────────────────────────────
@@ -83,7 +134,7 @@ def get_pipeline_connection() -> pyodbc.Connection:
         db_conf["driver"],
     )
 
-    return pyodbc.connect(conn_str)
+    return _connect_with_retry(conn_str, database_name=db_conf["pipeline_database"])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,7 +155,18 @@ def get_client_connection(database_name: Optional[str] = None) -> pyodbc.Connect
         db_conf["driver"],
     )
 
-    return pyodbc.connect(conn_str)
+    return _connect_with_retry(conn_str, database_name=db)
+
+
+@contextmanager
+def timed_stage(stage_name: str, **log_context):
+    started = time.perf_counter()
+    logger.info("START %s", stage_name, extra=log_context)
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - started
+        logger.info("END %s duration_seconds=%.3f", stage_name, elapsed, extra=log_context)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,8 +244,13 @@ def ai_store_db_writer(
 
         now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-        # Extract fingerprint from payload if not provided explicitly
-        _fingerprint = fingerprint or payload.get("fingerprint") or run_id
+        # Extract fingerprint from payload if not provided explicitly.
+        # Identity is fingerprint + artifact_type so one BRD can safely store
+        # requirements, KPIs, nominations, metadata, profiles, etc. separately.
+        base_fingerprint = fingerprint or payload.get("fingerprint") or run_id
+        storage_fingerprint = artifact_storage_fingerprint(base_fingerprint, artifact_type)
+        payload.setdefault("fingerprint", base_fingerprint)
+        payload.setdefault("storage_fingerprint", f"{base_fingerprint}:{artifact_type}")
         cost_usd = payload.get("cost_usd")
 
         cursor.execute(
@@ -192,7 +259,7 @@ def ai_store_db_writer(
             FROM [{schema}].[ai_store]
             WHERE fingerprint = ?
             """,
-            (_fingerprint,),
+            (storage_fingerprint,),
         )
         record_exists = cursor.fetchone()[0] > 0
 
@@ -231,7 +298,7 @@ def ai_store_db_writer(
                 output_tokens,
                 cost_usd,
                 now,
-                _fingerprint,
+                storage_fingerprint,
             )
         else:
             cursor.execute(
@@ -243,7 +310,7 @@ def ai_store_db_writer(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 run_id,
-                _fingerprint,
+                storage_fingerprint,
                 stage,
                 artifact_type,
                 json.dumps(payload),
@@ -365,6 +432,69 @@ def update_hitl_item(
         conn.commit()
     except Exception as e:
         logger.error("HITL item update failed for %s: %s", item_id, e)
+        raise
+    finally:
+        conn.close()
+
+
+def update_hitl_items_batch(items: Iterable[Dict[str, Optional[str]]]) -> None:
+    """Update HITL queue items in one transaction."""
+    items = list(items)
+    if not items:
+        return
+
+    db_conf = config["azure_sql"]
+    schema = db_conf["pipeline_schema"]
+
+    conn = get_pipeline_connection()
+    try:
+        cursor = conn.cursor()
+        for item in items:
+            cursor.execute(
+                f"""
+                UPDATE [{schema}].[hitl_review_queue]
+                SET gate_status = ?,
+                    edited_content = ?,
+                    rejection_reason = ?,
+                    decided_at = GETUTCDATE()
+                WHERE item_id = ?
+                """,
+                item["status"],
+                item.get("edited_content"),
+                item.get("rejection_reason"),
+                item["item_id"],
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error("Batch HITL update failed: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def save_checkpoint_state(run_id: str, state: Dict[str, Any]) -> None:
+    """Persist the latest full pipeline state for resumability."""
+    db_conf = config["azure_sql"]
+    schema = db_conf["pipeline_schema"]
+
+    conn = get_pipeline_connection()
+    try:
+        cursor = conn.cursor()
+        state_json = json.dumps(state, default=str)
+        cursor.execute(
+            f"""
+            MERGE [{schema}].[kpi_checkpoints] AS target
+            USING (VALUES (?)) AS source (run_id)
+            ON target.run_id = source.run_id
+            WHEN MATCHED THEN UPDATE SET full_state_json = ?, checkpoint_at = GETUTCDATE()
+            WHEN NOT MATCHED THEN INSERT (run_id, full_state_json, checkpoint_at) VALUES (?, ?, GETUTCDATE());
+            """,
+            (run_id, state_json, run_id, state_json),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("Checkpoint save failed for %s: %s", run_id, e)
         raise
     finally:
         conn.close()

@@ -50,3 +50,5 @@ uuid6>=2024.1
 sentence-transformers
 rich>=13.7.0
 langchain-huggingface>=0.1.2
+Flask>=3.0.0
+paramiko>=3.4.0

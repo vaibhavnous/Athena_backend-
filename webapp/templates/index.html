@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-stack">
+  <section class="card">
+    <div class="page-title">
+      <div class="title-block">
+        <h1>Athena Pipeline Console</h1>
+        <p class="muted">Start a BRD run, resume a review gate, or regenerate governed output artifacts.</p>
+      </div>
+      <div class="badge-row">
+        <span class="badge brand"><span class="dot-sm"></span>Gate review</span>
+        <span class="badge">Bronze</span>
+        <span class="badge">Silver</span>
+      </div>
+    </div>
+    <div class="metric-grid">
+      <div class="metric">
+        <span class="metric-label">Entry Point</span>
+        <span class="metric-value">BRD</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Human Gates</span>
+        <span class="metric-value">3</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Outputs</span>
+        <span class="metric-value">2</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="layout-grid">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Start Run</h2>
+        <span class="badge brand">New execution</span>
+      </div>
+      <div class="panel-body">
+        <form
+          method="post"
+          action="{{ url_for('upload_brd') }}"
+          enctype="multipart/form-data"
+          data-show-loader="true"
+          data-loader-title="Pipeline started"
+          data-loader-message="Running backend nodes until the next human gate is ready."
+          data-loader-steps="Ingestion|Memory Lookup|Requirement Extraction|KPI Extraction|Gate 1 Preparation"
+        >
+          <div class="form-group">
+            <label for="brd_file">Upload BRD</label>
+            <input id="brd_file" type="file" name="brd_file" />
+            <span class="input-help">Accepted inputs: .txt or .docx.</span>
+          </div>
+          <div class="form-group">
+            <label for="brd_text">BRD Text</label>
+            <textarea id="brd_text" name="brd_text" placeholder="Paste BRD content when no file is available."></textarea>
+          </div>
+          <div class="form-group">
+            <label for="source_databases">Source Databases</label>
+            <input id="source_databases" type="text" name="source_databases" placeholder="insurance" />
+          </div>
+          <div class="actions">
+            <button type="submit">Run Pipeline</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Resume Run</h2>
+        <span class="badge warn">Pending gate</span>
+      </div>
+      <div class="panel-body">
+        <form method="post" action="{{ url_for('resume_run') }}">
+          <div class="form-group">
+            <label for="run_id">Run ID</label>
+            <input id="run_id" class="mono" type="text" name="run_id" placeholder="paste existing run_id" />
+          </div>
+          <div class="actions">
+            <button type="submit" class="secondary">Open Run</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

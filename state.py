@@ -76,3 +76,37 @@ class Stage01State(TypedDict, total=False):
     column_profiles: Optional[Dict[str, Any]]
     column_profiling_status: Optional[str]  # 'COMPLETED' | 'COMPLETED_WITH_WARNINGS' | 'FAILED' | 'SKIPPED'
     column_profiling_error: Optional[str]
+
+    # ── Stage 06: Semantic Enrichment Review (Gate 3 HITL) ───────────────
+    enrichment_review_status: Optional[str]  # 'PENDING' | 'COMPLETED' | 'FAILED' | 'SKIPPED'
+    enrichment_review_error: Optional[str]
+    semantic_tags_reviewed: Optional[bool]
+    pii_classifications_reviewed: Optional[bool]
+    join_key_annotations_reviewed: Optional[bool]
+    enrichment_review_decision: Optional[str]  # 'APPROVED' | 'REJECTED' | 'PENDING'
+    enrichment_review_artifact: Optional[Dict[str, Any]]  # GATE3_APPROVED_ENRICHMENT
+
+    # —— Bronze Code Generation ————————————————————————————————————————————————
+    source_jdbc_url: Optional[str]
+    source_type: Optional[str]
+    sftp_source: Optional[Dict[str, Any]]
+    bronze_catalog: Optional[str]
+    bronze_schema: Optional[str]
+    bronze_generation_status: Optional[str]  # 'PENDING' | 'COMPLETED' | 'FAILED' | 'SKIPPED'
+    bronze_generation_error: Optional[str]
+    bronze_generated_at: Optional[str]
+    bronze_generation_results: Optional[List[Dict[str, Any]]]
+    bronze_generation_bundle_path: Optional[str]
+    bronze_generation_readme_path: Optional[str]
+    bronze_generation_ui_path: Optional[str]
+
+    # Silver Code Generation
+    silver_catalog: Optional[str]
+    silver_schema: Optional[str]
+    silver_generation_status: Optional[str]  # 'PENDING' | 'COMPLETED' | 'FAILED' | 'SKIPPED'
+    silver_generation_error: Optional[str]
+    silver_generated_at: Optional[str]
+    silver_generation_results: Optional[List[Dict[str, Any]]]
+    silver_generation_bundle_path: Optional[str]
+    silver_generation_readme_path: Optional[str]
+    silver_generation_ui_path: Optional[str]

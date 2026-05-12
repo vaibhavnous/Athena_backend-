@@ -1,16 +1,17 @@
 """
 Deterministic column profiling node for LangGraph.
 
-This node profiles the columns discovered by metadata_discovery using source
-database SQL pushdown. It is adapted from the Databricks NB08 notebook into the
-repo's pyodbc/Azure SQL runtime style.
+Implements NB08-style column profiling using:
+- PASS 1: Full-table SQL pushdown statistics
+- PASS 2: Sampled distribution statistics (MEASURE only)
+
+Caching intentionally NOT implemented.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-import json
 import os
 from typing import Any, Dict, List, Literal, Optional
 
@@ -19,9 +20,13 @@ from langgraph.graph import StateGraph
 from pydantic import BaseModel, Field
 
 from state import Stage01State
-from utilis.db import ai_store_db_writer, get_client_connection
+from utilis.db import ai_store_db_writer, get_client_connection, save_checkpoint_state, timed_stage
 from utilis.logger import logger
 
+
+# --------------------------------------------------------------------------------------
+# Constants & Types
+# --------------------------------------------------------------------------------------
 
 ProfileTier = Literal[
     "ID",
@@ -33,7 +38,6 @@ ProfileTier = Literal[
     "DEFAULT",
     "HIGH_CARD_TEXT",
 ]
-
 
 NUMERIC_TYPES = {
     "bigint",
@@ -47,6 +51,7 @@ NUMERIC_TYPES = {
     "smallmoney",
     "tinyint",
 }
+
 DATE_TYPES = {
     "date",
     "datetime",
@@ -55,6 +60,7 @@ DATE_TYPES = {
     "smalldatetime",
     "time",
 }
+
 TEXT_TYPES = {
     "char",
     "nchar",
@@ -64,6 +70,7 @@ TEXT_TYPES = {
     "ntext",
     "uniqueidentifier",
 }
+
 LOB_TYPES = {
     "binary",
     "geography",
@@ -76,23 +83,33 @@ LOB_TYPES = {
 }
 
 
+# --------------------------------------------------------------------------------------
+# Models
+# --------------------------------------------------------------------------------------
+
 class ColumnProfileResult(BaseModel):
     run_id: str
     database_name: str
     schema_name: str
     table_name: str
     column_name: str
-    data_type: Optional[str] = None
+    data_type: Optional[str]
     profile_tier: ProfileTier
+
     total_rows: Optional[int] = None
     non_null_count: Optional[int] = None
     null_rate: Optional[float] = None
     cardinality: Optional[int] = None
     col_min: Optional[str] = None
     col_max: Optional[str] = None
+
+    # PASS 2
     p25: Optional[float] = None
     p75: Optional[float] = None
+
+    # Samples
     top_samples: Optional[List[Dict[str, Any]]] = None
+
     profiling_status: Literal["SUCCESS", "FAILED"] = "SUCCESS"
     error_message: Optional[str] = None
     profiled_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -113,70 +130,279 @@ class ProfilingTable(BaseModel):
     database_name: str
     schema_name: str
     table_name: str
-    columns: List[Dict[str, Any]] = Field(default_factory=list)
+    columns: List[Dict[str, Any]]
 
+
+# --------------------------------------------------------------------------------------
+# Helpers / Config
+# --------------------------------------------------------------------------------------
 
 def _copy_state(state: Stage01State) -> Stage01State:
     return state.copy()
 
 
 def _profiling_max_workers() -> int:
-    raw = os.environ.get("COLUMN_PROFILING_MAX_WORKERS", "4")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 4
+    return max(1, int(os.environ.get("COLUMN_PROFILING_MAX_WORKERS", "4")))
 
 
 def _profiling_sample_pct() -> float:
-    raw = os.environ.get("COLUMN_PROFILING_SAMPLE_PCT", "10")
-    try:
-        pct = float(raw)
-    except ValueError:
-        return 10.0
+    pct = float(os.environ.get("COLUMN_PROFILING_SAMPLE_PCT", "10"))
     return min(max(pct, 0.1), 100.0)
 
 
 def _high_cardinality_threshold() -> int:
-    raw = os.environ.get("COLUMN_PROFILING_HIGH_CARDINALITY_THRESHOLD", "100")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 100
+    return max(1, int(os.environ.get("COLUMN_PROFILING_HIGH_CARDINALITY_THRESHOLD", "100")))
 
 
 def _top_sample_limit() -> int:
-    raw = os.environ.get("COLUMN_PROFILING_TOP_SAMPLE_LIMIT", "10")
-    try:
-        return min(max(1, int(raw)), 100)
-    except ValueError:
-        return 10
+    return min(max(1, int(os.environ.get("COLUMN_PROFILING_TOP_SAMPLE_LIMIT", "10"))), 100)
 
 
 def _quote_identifier(identifier: str) -> str:
-    clean = str(identifier or "").strip()
-    if not clean:
-        raise ValueError("SQL identifier cannot be empty")
-    return f"[{clean.replace(']', ']]')}]"
+    return f"[{identifier.replace(']', ']]')}]"
 
 
-def _qualified_table(schema_name: str, table_name: str) -> str:
-    return f"{_quote_identifier(schema_name)}.{_quote_identifier(table_name)}"
+def _qualified_table(schema: str, table: str) -> str:
+    return f"{_quote_identifier(schema)}.{_quote_identifier(table)}"
 
 
 def _tablesample_clause() -> str:
     return f"TABLESAMPLE({_profiling_sample_pct()} PERCENT)"
 
 
-def _execute_source_query(database_name: str, query: str) -> List[Any]:
-    conn = get_client_connection(database_name)
+def _execute_query(database: str, query: str):
+    conn = get_client_connection(database)
     try:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        return cursor.fetchall()
+        cur = conn.cursor()
+        cur.execute(query)
+        return cur.fetchall()
     finally:
         conn.close()
 
+
+def _row_value(row, name: str):
+    if hasattr(row, name):
+        return getattr(row, name)
+    try:
+        return row[name]
+    except Exception:
+        return None
+
+
+def _supports_cardinality(data_type: Optional[str]) -> bool:
+    return str(data_type or "").lower() not in LOB_TYPES
+
+
+# --------------------------------------------------------------------------------------
+# Tier Classification
+# --------------------------------------------------------------------------------------
+
+def classify_profile_tier(column: Dict[str, Any]) -> ProfileTier:
+    name = str(column.get("column_name", "")).lower()
+    data_type = str(column.get("data_type", "")).lower()
+    semantic = str(column.get("semantic_type", "")).upper()
+
+    if semantic in {"ID", "SURROGATE_KEY"} or name == "id" or name.endswith("_id"):
+        return "ID"
+    if semantic == "AUDIT_TIMESTAMP":
+        return "AUDIT"
+    if data_type == "bit" or name.startswith(("is_", "has_")):
+        return "FLAG"
+    if data_type in DATE_TYPES:
+        return "DATE"
+    if semantic == "MEASURE" or data_type in NUMERIC_TYPES:
+        return "MEASURE"
+    if semantic == "DIMENSION" or data_type in TEXT_TYPES:
+        return "DIMENSION"
+    return "DEFAULT"
+
+
+# --------------------------------------------------------------------------------------
+# PASS 1 — Pushdown Profiling
+# --------------------------------------------------------------------------------------
+
+def pass1_pushdown_profile(
+    database: str,
+    schema: str,
+    table: str,
+    column: str,
+    data_type: Optional[str],
+    tier: ProfileTier,
+) -> Dict[str, Any]:
+
+    col_sql = _quote_identifier(column)
+    table_sql = _qualified_table(schema, table)
+
+    exprs = [
+        "COUNT_BIG(*) AS total_rows",
+        f"COUNT_BIG({col_sql}) AS non_null_count",
+    ]
+
+    if tier != "AUDIT" and _supports_cardinality(data_type):
+        exprs.append(f"COUNT_BIG(DISTINCT {col_sql}) AS cardinality")
+
+    if tier in {"MEASURE", "DATE"}:
+        exprs.append(f"MIN({col_sql}) AS col_min")
+        exprs.append(f"MAX({col_sql}) AS col_max")
+
+    query = f"SELECT {', '.join(exprs)} FROM {table_sql}"
+    row = _execute_query(database, query)[0]
+
+    total = int(row.total_rows or 0)
+    non_null = int(row.non_null_count or 0)
+    null_rate = round(1.0 - (non_null / total), 6) if total > 0 else 0.0
+
+    result = {
+        "total_rows": total,
+        "non_null_count": non_null,
+        "null_rate": null_rate,
+    }
+
+    if hasattr(row, "cardinality"):
+        result["cardinality"] = int(row.cardinality) if row.cardinality is not None else None
+    if tier in {"MEASURE", "DATE"}:
+        result["col_min"] = str(row.col_min) if row.col_min is not None else None
+        result["col_max"] = str(row.col_max) if row.col_max is not None else None
+
+    return result
+
+
+def pass1_table_pushdown_profile(table_ref: ProfilingTable) -> Dict[str, Dict[str, Any]]:
+    """Run pass-1 aggregate metrics for all columns in one table scan."""
+    table_sql = _qualified_table(table_ref.schema_name, table_ref.table_name)
+    exprs = ["COUNT_BIG(*) AS [total_rows]"]
+    column_meta: List[tuple[int, Dict[str, Any], ProfileTier]] = []
+
+    for idx, column in enumerate(table_ref.columns):
+        name = str(column["column_name"])
+        data_type = column.get("data_type")
+        tier = classify_profile_tier(column)
+        col_sql = _quote_identifier(name)
+        column_meta.append((idx, column, tier))
+        exprs.append(f"COUNT_BIG({col_sql}) AS [c{idx}_non_null]")
+
+        if tier != "AUDIT" and _supports_cardinality(data_type):
+            exprs.append(f"COUNT_BIG(DISTINCT {col_sql}) AS [c{idx}_cardinality]")
+
+        if tier in {"MEASURE", "DATE"}:
+            exprs.append(f"MIN({col_sql}) AS [c{idx}_min]")
+            exprs.append(f"MAX({col_sql}) AS [c{idx}_max]")
+
+    query = f"SELECT {', '.join(exprs)} FROM {table_sql}"
+    row = _execute_query(table_ref.database_name, query)[0]
+    total = int(_row_value(row, "total_rows") or 0)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for idx, column, tier in column_meta:
+        name = str(column["column_name"])
+        non_null = int(_row_value(row, f"c{idx}_non_null") or 0)
+        result: Dict[str, Any] = {
+            "total_rows": total,
+            "non_null_count": non_null,
+            "null_rate": round(1.0 - (non_null / total), 6) if total > 0 else 0.0,
+        }
+
+        cardinality = _row_value(row, f"c{idx}_cardinality")
+        if cardinality is not None:
+            result["cardinality"] = int(cardinality)
+
+        if tier in {"MEASURE", "DATE"}:
+            col_min = _row_value(row, f"c{idx}_min")
+            col_max = _row_value(row, f"c{idx}_max")
+            result["col_min"] = str(col_min) if col_min is not None else None
+            result["col_max"] = str(col_max) if col_max is not None else None
+
+        results[name] = result
+
+    return results
+
+
+# --------------------------------------------------------------------------------------
+# PASS 2 — Sampling (MEASURE only)
+# --------------------------------------------------------------------------------------
+
+def pass2_measure_sampling(database: str, schema: str, table: str, column: str) -> Dict[str, Optional[float]]:
+    col_sql = _quote_identifier(column)
+    table_sql = _qualified_table(schema, table)
+
+    query = f"""
+        SELECT DISTINCT
+            PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY TRY_CONVERT(float, {col_sql})) OVER () AS p25,
+            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY TRY_CONVERT(float, {col_sql})) OVER () AS p75
+        FROM {table_sql} {_tablesample_clause()}
+        WHERE TRY_CONVERT(float, {col_sql}) IS NOT NULL
+    """
+
+    rows = _execute_query(database, query)
+    if not rows:
+        return {"p25": None, "p75": None}
+
+    r = rows[0]
+    return {
+        "p25": float(r.p25) if r.p25 is not None else None,
+        "p75": float(r.p75) if r.p75 is not None else None,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Column Orchestration (PASS 1 → PASS 2)
+# --------------------------------------------------------------------------------------
+
+def profile_column(
+    table_ref: ProfilingTable,
+    column: Dict[str, Any],
+    run_id: str,
+    pass1_result: Optional[Dict[str, Any]] = None,
+) -> ColumnProfileResult:
+    name = str(column["column_name"])
+    data_type = column.get("data_type")
+    tier = classify_profile_tier(column)
+
+    base = dict(
+        run_id=run_id,
+        database_name=table_ref.database_name,
+        schema_name=table_ref.schema_name,
+        table_name=table_ref.table_name,
+        column_name=name,
+        data_type=data_type,
+        profile_tier=tier,
+    )
+
+    try:
+        if pass1_result is None:
+            pass1_result = pass1_pushdown_profile(
+                table_ref.database_name,
+                table_ref.schema_name,
+                table_ref.table_name,
+                name,
+                data_type,
+                tier,
+            )
+        result = {**base, **pass1_result}
+
+        if tier == "MEASURE":
+            result.update(
+                pass2_measure_sampling(
+                    table_ref.database_name,
+                    table_ref.schema_name,
+                    table_ref.table_name,
+                    name,
+                )
+            )
+
+        return ColumnProfileResult(**result)
+
+    except Exception as exc:
+        return ColumnProfileResult(
+            **base,
+            profiling_status="FAILED",
+            error_message=str(exc),
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Table + State Glue
+# --------------------------------------------------------------------------------------
 
 def _resolve_tables_for_profiling(state: Stage01State) -> List[ProfilingTable]:
     discovered = state.get("discovered_metadata") or {}
@@ -189,19 +415,19 @@ def _resolve_tables_for_profiling(state: Stage01State) -> List[ProfilingTable]:
         if item.get("table_status") != "COMPLETED":
             continue
 
-        database_name = str(item.get("database_name") or "").strip()
-        schema_name = str(item.get("schema_name") or "dbo").strip()
-        table_name = str(item.get("table_name") or "").strip()
+        database = str(item.get("database_name", "")).strip()
+        schema = str(item.get("schema_name", "dbo")).strip()
+        table = str(item.get("table_name", "")).strip()
         columns = item.get("columns") or []
 
-        if not database_name or not table_name or not columns:
+        if not database or not table or not columns:
             continue
 
         resolved.append(
             ProfilingTable(
-                database_name=database_name,
-                schema_name=schema_name,
-                table_name=table_name,
+                database_name=database,
+                schema_name=schema,
+                table_name=table,
                 columns=[col for col in columns if isinstance(col, dict)],
             )
         )
@@ -209,230 +435,11 @@ def _resolve_tables_for_profiling(state: Stage01State) -> List[ProfilingTable]:
     return resolved
 
 
-def classify_profile_tier(column: Dict[str, Any]) -> ProfileTier:
-    semantic_type = str(column.get("semantic_type") or "").upper()
-    column_name = str(column.get("column_name") or "").lower()
-    data_type = str(column.get("data_type") or "").lower()
-
-    if semantic_type in {"ID", "SURROGATE_KEY"} or column_name == "id" or column_name.endswith("_id"):
-        return "ID"
-    if semantic_type == "AUDIT_TIMESTAMP" or column_name in {
-        "created_at",
-        "updated_at",
-        "modified_at",
-        "created_date",
-        "updated_date",
-        "modified_date",
-    }:
-        return "AUDIT"
-    if semantic_type == "FLAG" or data_type == "bit" or column_name.startswith(("is_", "has_")):
-        return "FLAG"
-    if data_type in DATE_TYPES:
-        return "DATE"
-    if semantic_type == "MEASURE" or data_type in NUMERIC_TYPES:
-        return "MEASURE"
-    if semantic_type == "DIMENSION" or data_type in TEXT_TYPES:
-        return "DIMENSION"
-    return "DEFAULT"
-
-
-def _supports_cardinality(data_type: Optional[str]) -> bool:
-    return str(data_type or "").lower() not in LOB_TYPES
-
-
-def _fetch_pushdown_stats(
-    database_name: str,
-    schema_name: str,
-    table_name: str,
-    column_name: str,
-    data_type: Optional[str],
-    tier: ProfileTier,
-) -> Dict[str, Any]:
-    column_sql = _quote_identifier(column_name)
-    table_sql = _qualified_table(schema_name, table_name)
-
-    expressions = [
-        "COUNT_BIG(*) AS total_rows",
-        f"COUNT_BIG({column_sql}) AS non_null_count",
-    ]
-    include_cardinality = tier != "AUDIT" and _supports_cardinality(data_type)
-    if include_cardinality:
-        expressions.append(f"COUNT_BIG(DISTINCT {column_sql}) AS cardinality")
-    if tier in {"MEASURE", "DATE"}:
-        expressions.append(f"MIN({column_sql}) AS col_min")
-        expressions.append(f"MAX({column_sql}) AS col_max")
-
-    query = f"SELECT {', '.join(expressions)} FROM {table_sql}"
-    row = _execute_source_query(database_name, query)[0]
-
-    total_rows = int(row.total_rows or 0)
-    non_null_count = int(row.non_null_count or 0)
-    null_rate = round(1.0 - (non_null_count / total_rows), 6) if total_rows > 0 else 0.0
-
-    result: Dict[str, Any] = {
-        "total_rows": total_rows,
-        "non_null_count": non_null_count,
-        "null_rate": null_rate,
-    }
-    if include_cardinality:
-        result["cardinality"] = int(row.cardinality) if row.cardinality is not None else None
-    if tier in {"MEASURE", "DATE"}:
-        result["col_min"] = str(row.col_min) if row.col_min is not None else None
-        result["col_max"] = str(row.col_max) if row.col_max is not None else None
-
-    return result
-
-
-def _fetch_measure_percentiles(
-    database_name: str,
-    schema_name: str,
-    table_name: str,
-    column_name: str,
-) -> tuple[Optional[float], Optional[float]]:
-    column_sql = _quote_identifier(column_name)
-    table_sql = _qualified_table(schema_name, table_name)
-    query = f"""
-        SELECT DISTINCT
-            PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY TRY_CONVERT(float, {column_sql})) OVER () AS p25,
-            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY TRY_CONVERT(float, {column_sql})) OVER () AS p75
-        FROM {table_sql} {_tablesample_clause()}
-        WHERE {column_sql} IS NOT NULL
-          AND TRY_CONVERT(float, {column_sql}) IS NOT NULL
-    """
-
-    try:
-        rows = _execute_source_query(database_name, query)
-        if not rows:
-            return None, None
-        row = rows[0]
-        return (
-            float(row.p25) if row.p25 is not None else None,
-            float(row.p75) if row.p75 is not None else None,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Percentile profiling failed for %s.%s.%s: %s",
-            schema_name,
-            table_name,
-            column_name,
-            str(exc)[:120],
-            extra={"node": "column_profiling"},
-        )
-        return None, None
-
-
-def _fetch_top_samples(
-    database_name: str,
-    schema_name: str,
-    table_name: str,
-    column_name: str,
-) -> Optional[List[Dict[str, Any]]]:
-    column_sql = _quote_identifier(column_name)
-    table_sql = _qualified_table(schema_name, table_name)
-    limit = _top_sample_limit()
-    query = f"""
-        SELECT TOP ({limit})
-            CAST({column_sql} AS nvarchar(4000)) AS sample_value,
-            COUNT_BIG(*) AS sample_count
-        FROM {table_sql} {_tablesample_clause()}
-        WHERE {column_sql} IS NOT NULL
-        GROUP BY CAST({column_sql} AS nvarchar(4000))
-        ORDER BY sample_count DESC
-    """
-
-    try:
-        rows = _execute_source_query(database_name, query)
-        samples = [
-            {
-                "value": str(row.sample_value),
-                "count": int(row.sample_count or 0),
-            }
-            for row in rows
-            if row.sample_value is not None
-        ]
-        return samples or None
-    except Exception as exc:
-        logger.warning(
-            "Top-sample profiling failed for %s.%s.%s: %s",
-            schema_name,
-            table_name,
-            column_name,
-            str(exc)[:120],
-            extra={"node": "column_profiling"},
-        )
-        return None
-
-
-def profile_column(table_ref: ProfilingTable, column: Dict[str, Any], run_id: str) -> ColumnProfileResult:
-    column_name = str(column.get("column_name") or "")
-    data_type = str(column.get("data_type") or "") or None
-    tier = classify_profile_tier(column)
-    base = {
-        "run_id": run_id,
-        "database_name": table_ref.database_name,
-        "schema_name": table_ref.schema_name,
-        "table_name": table_ref.table_name,
-        "column_name": column_name,
-        "data_type": data_type,
-        "profile_tier": tier,
-        "profiled_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    try:
-        result = {
-            **base,
-            **_fetch_pushdown_stats(
-                table_ref.database_name,
-                table_ref.schema_name,
-                table_ref.table_name,
-                column_name,
-                data_type,
-                tier,
-            ),
-        }
-
-        if tier == "MEASURE":
-            p25, p75 = _fetch_measure_percentiles(
-                table_ref.database_name,
-                table_ref.schema_name,
-                table_ref.table_name,
-                column_name,
-            )
-            result["p25"] = p25
-            result["p75"] = p75
-
-        if tier in {"FLAG", "DIMENSION", "DEFAULT"}:
-            cardinality = result.get("cardinality")
-            if cardinality is not None and cardinality <= _high_cardinality_threshold():
-                result["top_samples"] = _fetch_top_samples(
-                    table_ref.database_name,
-                    table_ref.schema_name,
-                    table_ref.table_name,
-                    column_name,
-                )
-            elif cardinality is not None and cardinality > _high_cardinality_threshold():
-                result["profile_tier"] = "HIGH_CARD_TEXT"
-
-        return ColumnProfileResult(**result)
-    except Exception as exc:
-        logger.warning(
-            "Column profiling failed for %s.%s.%s: %s",
-            table_ref.schema_name,
-            table_ref.table_name,
-            column_name,
-            str(exc)[:160],
-            extra={"node": "column_profiling"},
-        )
-        return ColumnProfileResult(
-            **base,
-            profiling_status="FAILED",
-            error_message=str(exc)[:500],
-        )
-
-
 def profile_table(table_ref: ProfilingTable, run_id: str) -> tuple[TableProfileResult, List[ColumnProfileResult]]:
-    start = datetime.now(timezone.utc)
+    started = datetime.now(timezone.utc)
+
     if not table_ref.columns:
+        duration = (datetime.now(timezone.utc) - started).total_seconds()
         return (
             TableProfileResult(
                 database_name=table_ref.database_name,
@@ -441,24 +448,40 @@ def profile_table(table_ref: ProfilingTable, run_id: str) -> tuple[TableProfileR
                 columns_profiled=0,
                 columns_failed=0,
                 status="SKIPPED",
-                duration_seconds=0.0,
+                duration_seconds=duration,
                 error_message="No columns available for profiling",
             ),
             [],
         )
 
-    profiles = [profile_column(table_ref, column, run_id) for column in table_ref.columns]
+    try:
+        pass1_results = pass1_table_pushdown_profile(table_ref)
+    except Exception as exc:
+        logger.warning(
+            "Table-level profiling failed for %s.%s.%s, falling back to per-column scans: %s",
+            table_ref.database_name,
+            table_ref.schema_name,
+            table_ref.table_name,
+            exc,
+            extra={"run_id": run_id, "node": "column_profiling"},
+        )
+        pass1_results = {}
+
+    profiles = [
+        profile_column(table_ref, column, run_id, pass1_results.get(str(column["column_name"])))
+        for column in table_ref.columns
+    ]
     failed = sum(1 for profile in profiles if profile.profiling_status == "FAILED")
     success = len(profiles) - failed
-    duration = (datetime.now(timezone.utc) - start).total_seconds()
 
-    if failed == 0:
-        status: Literal["SUCCESS", "PARTIAL", "FAILED", "SKIPPED"] = "SUCCESS"
-    elif success > 0:
+    if success == 0:
+        status: Literal["SUCCESS", "PARTIAL", "FAILED", "SKIPPED"] = "FAILED"
+    elif failed > 0:
         status = "PARTIAL"
     else:
-        status = "FAILED"
+        status = "SUCCESS"
 
+    duration = (datetime.now(timezone.utc) - started).total_seconds()
     return (
         TableProfileResult(
             database_name=table_ref.database_name,
@@ -467,7 +490,7 @@ def profile_table(table_ref: ProfilingTable, run_id: str) -> tuple[TableProfileR
             columns_profiled=success,
             columns_failed=failed,
             status=status,
-            duration_seconds=round(duration, 3),
+            duration_seconds=duration,
         ),
         profiles,
     )
@@ -515,11 +538,7 @@ def _persist_column_profiles(
 
 def column_profiling_node(state: Stage01State) -> Stage01State:
     new_state = _copy_state(state)
-    log_context = {
-        "run_id": new_state.get("run_id", "unknown"),
-        "node": "column_profiling",
-    }
-
+    log_context = {"run_id": new_state.get("run_id", "unknown"), "node": "column_profiling"}
     logger.info("START column_profiling_node", extra=log_context)
 
     if new_state.get("status") == "FAILED":
@@ -545,35 +564,24 @@ def column_profiling_node(state: Stage01State) -> Stage01State:
     column_profiles: List[ColumnProfileResult] = []
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with timed_stage("column_profiling_tables", **log_context), ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(profile_table, table_ref, run_id): table_ref for table_ref in table_refs}
             for future in as_completed(futures):
-                table_ref = futures[future]
-                try:
-                    table_result, profiles = future.result()
-                except Exception as exc:
-                    logger.warning(
-                        "Table profiling failed for %s.%s.%s: %s",
-                        table_ref.database_name,
-                        table_ref.schema_name,
-                        table_ref.table_name,
-                        str(exc)[:160],
-                        extra=log_context,
-                    )
-                    table_result = TableProfileResult(
-                        database_name=table_ref.database_name,
-                        schema_name=table_ref.schema_name,
-                        table_name=table_ref.table_name,
-                        columns_profiled=0,
-                        columns_failed=len(table_ref.columns),
-                        status="FAILED",
-                        duration_seconds=0.0,
-                        error_message=str(exc)[:500],
-                    )
-                    profiles = []
-
+                table_result, profiles = future.result()
                 table_results.append(table_result)
                 column_profiles.extend(profiles)
+                partial_state = {
+                    **new_state,
+                    "column_profiles": {
+                        "table_results": [table.model_dump(mode="json") for table in table_results],
+                        "column_profiles": [profile.model_dump(mode="json") for profile in column_profiles],
+                    },
+                    "column_profiling_status": "IN_PROGRESS",
+                }
+                try:
+                    save_checkpoint_state(run_id, partial_state)
+                except Exception:
+                    logger.warning("Partial profiling checkpoint failed", extra=log_context)
 
         payload = _persist_column_profiles(
             run_id=run_id,
@@ -592,7 +600,9 @@ def column_profiling_node(state: Stage01State) -> Stage01State:
         return new_state
 
     failed_tables = sum(1 for table in table_results if table.status == "FAILED")
-    status = "COMPLETED" if failed_tables == 0 else "COMPLETED_WITH_WARNINGS"
+    partial_tables = sum(1 for table in table_results if table.status == "PARTIAL")
+    status = "COMPLETED_WITH_WARNINGS" if (failed_tables or partial_tables) else "COMPLETED"
+
     new_state.update(
         {
             "column_profiles": payload,

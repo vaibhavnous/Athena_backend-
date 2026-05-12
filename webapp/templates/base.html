@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title or "Athena Pipeline" }}</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --surface: #ffffff;
+      --surface-2: #f9fafb;
+      --surface-3: #eef2f7;
+      --ink: #17202a;
+      --ink-soft: #374151;
+      --muted: #6b7280;
+      --line: #d8dee8;
+      --line-strong: #b7c0cd;
+      --brand: #0f766e;
+      --brand-strong: #115e59;
+      --brand-soft: #e7f6f4;
+      --accent: #b45309;
+      --accent-soft: #fff7ed;
+      --good: #15803d;
+      --good-soft: #ecfdf3;
+      --warn: #b45309;
+      --warn-soft: #fffbeb;
+      --bad: #b42318;
+      --bad-soft: #fff1f2;
+      --code: #101828;
+      --radius: 8px;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+      --focus: 0 0 0 3px rgba(15, 118, 110, 0.16);
+    }
+
+    * { box-sizing: border-box; }
+    html { min-height: 100%; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: var(--bg);
+      font: 14px/1.5 Arial, Helvetica, sans-serif;
+    }
+    a { color: var(--brand-strong); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: #111827;
+      color: #ffffff;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .topbar {
+      max-width: 1440px;
+      height: 56px;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #ffffff;
+      text-decoration: none;
+      min-width: 0;
+    }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      border-radius: 6px;
+      display: grid;
+      place-items: center;
+      background: var(--brand);
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    .brand-text { display: flex; flex-direction: column; line-height: 1.1; min-width: 0; }
+    .brand-name { font-weight: 700; color: #ffffff; }
+    .brand-sub { color: #a7b0bf; font-size: 12px; margin-top: 3px; }
+    .header-right { display: flex; align-items: center; gap: 8px; }
+    .header-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #d0d5dd;
+      background: rgba(255, 255, 255, 0.05);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #22c55e;
+    }
+
+    main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .page-stack { display: grid; gap: 16px; }
+    .layout-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .grid { display: grid; gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card,
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .card { padding: 18px; margin-bottom: 16px; }
+    .panel { overflow: hidden; }
+    .panel-head {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+    .panel-body { padding: 16px; }
+
+    .hero-card { padding: 18px; }
+    .page-title {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .title-block { min-width: 0; }
+    .section-title,
+    h1, h2, h3, h4 {
+      margin: 0;
+      color: var(--ink);
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    h1 { font-size: 24px; }
+    h2 { font-size: 18px; }
+    h3, .section-title { font-size: 16px; }
+    h4 { font-size: 14px; margin: 18px 0 10px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .mono {
+      font-family: Consolas, "SFMono-Regular", Menlo, Monaco, monospace;
+      font-size: 12px;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      padding: 12px;
+      min-height: 76px;
+    }
+    .metric-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 7px;
+    }
+    .metric-value {
+      display: block;
+      color: var(--ink);
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .badge-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--ink-soft);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .badge.good { background: var(--good-soft); border-color: #a6d8b8; color: var(--good); }
+    .badge.warn { background: var(--warn-soft); border-color: #fedf89; color: var(--warn); }
+    .badge.bad { background: var(--bad-soft); border-color: #fecdca; color: var(--bad); }
+    .badge.brand { background: var(--brand-soft); border-color: #99d6cf; color: var(--brand-strong); }
+    .badge .dot-sm {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .flash {
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      font-weight: 700;
+    }
+    .flash.success { background: var(--good-soft); color: var(--good); border-color: #a6d8b8; }
+    .flash.error { background: var(--bad-soft); color: var(--bad); border-color: #fecdca; }
+    .flash.warning { background: var(--warn-soft); color: var(--warn); border-color: #fedf89; }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-top: 14px;
+    }
+    button,
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 8px 14px;
+      border: 1px solid var(--brand-strong);
+      border-radius: 6px;
+      background: var(--brand);
+      color: #ffffff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    button:hover,
+    .btn:hover {
+      background: var(--brand-strong);
+      text-decoration: none;
+    }
+    button.secondary,
+    .btn.secondary {
+      background: var(--surface);
+      color: var(--ink-soft);
+      border-color: var(--line-strong);
+    }
+    button.secondary:hover,
+    .btn.secondary:hover {
+      background: var(--surface-3);
+    }
+    button:disabled {
+      opacity: 0.58;
+      cursor: not-allowed;
+    }
+
+    .form-group { display: grid; gap: 6px; margin-bottom: 14px; }
+    label {
+      color: var(--ink-soft);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input[type="text"],
+    input[type="file"],
+    textarea,
+    select {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--ink);
+      font: inherit;
+    }
+    input:focus,
+    textarea:focus,
+    select:focus {
+      outline: none;
+      border-color: var(--brand);
+      box-shadow: var(--focus);
+    }
+    textarea { min-height: 132px; resize: vertical; }
+    .table-textarea { min-height: 70px; }
+    .input-help { color: var(--muted); font-size: 12px; }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th,
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--surface-3);
+      color: var(--ink-soft);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #fbfcfe; }
+    .table-tight td { padding-top: 7px; padding-bottom: 7px; }
+    .numeric { text-align: right; font-variant-numeric: tabular-nums; }
+
+    .pipeline-steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
+    .pipeline-step {
+      position: relative;
+      min-height: 86px;
+      padding: 12px 12px 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      overflow: hidden;
+      cursor: pointer;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease, background 0.15s ease;
+    }
+    .pipeline-step:hover,
+    .pipeline-step:focus {
+      outline: none;
+      border-color: var(--brand);
+      box-shadow: var(--focus), 0 8px 20px rgba(16, 24, 40, 0.08);
+      transform: translateY(-1px);
+    }
+    .pipeline-step.selected {
+      border-color: var(--brand);
+      box-shadow: inset 0 0 0 1px var(--brand), 0 8px 20px rgba(16, 24, 40, 0.08);
+    }
+    .pipeline-step::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 4px;
+      background: var(--line-strong);
+    }
+    .pipeline-step.complete::before { background: var(--good); }
+    .pipeline-step.running::before { background: var(--warn); }
+    .pipeline-step.failed::before { background: var(--bad); }
+    .pipeline-step.complete { background: var(--good-soft); border-color: #a6d8b8; }
+    .pipeline-step.running { background: var(--warn-soft); border-color: #fedf89; }
+    .pipeline-step.failed { background: var(--bad-soft); border-color: #fecdca; }
+    .pipeline-step.pending { color: var(--muted); }
+    .step-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 800;
+      color: var(--ink);
+      margin-bottom: 7px;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--line-strong);
+      flex: 0 0 auto;
+    }
+    .complete .dot { background: var(--good); }
+    .failed .dot { background: var(--bad); }
+    .running .dot {
+      width: 13px;
+      height: 13px;
+      border: 2px solid rgba(180, 83, 9, 0.22);
+      border-top-color: var(--warn);
+      background: transparent;
+      animation: spin 0.8s linear infinite;
+    }
+    .step-detail {
+      margin: 0;
+      padding-left: 17px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .pipeline-inspector {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+    .pipeline-inspector-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .pipeline-inspector-title {
+      font-weight: 800;
+      color: var(--ink);
+    }
+    .pipeline-inspector-detail {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .script-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 10px;
+    }
+    .script-title {
+      margin: 0;
+      font-weight: 800;
+      color: var(--ink-soft);
+    }
+    pre {
+      margin: 0;
+      max-height: 520px;
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid #26364a;
+      border-radius: var(--radius);
+      background: var(--code);
+      color: #e5edf5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.55 Consolas, "SFMono-Regular", Menlo, Monaco, monospace;
+    }
+
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      padding: 20px;
+      align-items: center;
+      justify-content: center;
+      background: rgba(17, 24, 39, 0.58);
+    }
+    .overlay.show { display: flex; }
+    .overlay-card {
+      width: min(460px, 100%);
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 24px 70px rgba(17, 24, 39, 0.24);
+      text-align: left;
+    }
+    .spinner-ring {
+      width: 38px;
+      height: 38px;
+      border: 3px solid var(--line);
+      border-top-color: var(--brand);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
+    }
+    #pipeline-overlay-title {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 16px;
+      font-weight: 800;
+    }
+    #pipeline-overlay-message {
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+    .loader-steps {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border-top: 1px solid var(--line);
+    }
+    .loader-steps li {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .loader-steps li:last-child { border-bottom: 0; }
+    .mini-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--line-strong);
+      flex: 0 0 auto;
+    }
+    .loader-steps .active {
+      color: var(--brand-strong);
+      font-weight: 800;
+    }
+    .loader-steps .active .mini-dot {
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(15, 118, 110, 0.2);
+      border-top-color: var(--brand);
+      background: transparent;
+      animation: spin 0.8s linear infinite;
+    }
+    .loader-steps .done { color: var(--good); }
+    .loader-steps .done .mini-dot { background: var(--good); }
+
+    @media (max-width: 980px) {
+      .layout-grid,
+      .grid.two,
+      .grid.three { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 680px) {
+      .topbar { height: auto; padding: 12px 14px; flex-wrap: wrap; }
+      main { padding: 14px; }
+      .page-title { display: grid; }
+      .card { padding: 14px; }
+      .pipeline-steps { grid-template-columns: 1fr; }
+      table { min-width: 720px; }
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <a class="brand-group" href="{{ url_for('index') }}">
+        <span class="brand-mark">A</span>
+        <span class="brand-text">
+          <span class="brand-name">Athena Pipeline</span>
+          <span class="brand-sub">BRD to governed script generation</span>
+        </span>
+      </a>
+      <div class="header-right">
+        <span class="header-pill"><span class="pulse-dot"></span>Ready</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <div id="pipeline-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="pipeline-overlay-title">
+    <div class="overlay-card">
+      <div class="spinner-ring" aria-hidden="true"></div>
+      <strong id="pipeline-overlay-title">Pipeline running</strong>
+      <p id="pipeline-overlay-message">Please wait. The backend is processing the next node chain.</p>
+      <ul id="pipeline-overlay-steps" class="loader-steps" aria-live="polite"></ul>
+    </div>
+  </div>
+
+  <script>
+    var loaderTimer = null;
+
+    function startStepLoader(steps) {
+      var list = document.getElementById("pipeline-overlay-steps");
+      var activeIndex = 0;
+
+      function renderSteps() {
+        list.innerHTML = steps.map(function(step, index) {
+          var state = index < activeIndex ? "done" : (index === activeIndex ? "active" : "");
+          return '<li class="' + state + '"><span class="mini-dot" aria-hidden="true"></span><span>' + step + '</span></li>';
+        }).join("");
+      }
+
+      if (loaderTimer) clearInterval(loaderTimer);
+      renderSteps();
+      loaderTimer = setInterval(function() {
+        activeIndex = Math.min(activeIndex + 1, steps.length - 1);
+        renderSteps();
+      }, 1800);
+    }
+
+    document.addEventListener("submit", function(event) {
+      var form = event.target;
+      if (!form || !form.matches("form[data-show-loader='true']")) return;
+
+      if (form.dataset.submitted === "true") {
+        event.preventDefault();
+        return;
+      }
+      form.dataset.submitted = "true";
+
+      window.setTimeout(function() {
+        form.querySelectorAll("button[type='submit']").forEach(function(button) {
+          button.disabled = true;
+          button.textContent = "Submitted";
+        });
+      }, 0);
+
+      var title = form.dataset.loaderTitle || "Pipeline running";
+      var message = form.dataset.loaderMessage || "Please wait. The backend is processing the next node chain.";
+      var steps = (form.dataset.loaderSteps || "")
+        .split("|")
+        .map(function(step) { return step.trim(); })
+        .filter(Boolean);
+
+      document.getElementById("pipeline-overlay-title").textContent = title;
+      document.getElementById("pipeline-overlay-message").textContent = message;
+      startStepLoader(steps.length ? steps : ["Processing backend request"]);
+      document.getElementById("pipeline-overlay").classList.add("show");
+    });
+
+    function setPipelineInspector(node) {
+      var inspector = document.getElementById("pipeline-node-inspector");
+      if (!inspector || !node) return;
+
+      document.querySelectorAll(".pipeline-step.selected").forEach(function(item) {
+        item.classList.remove("selected");
+      });
+      node.classList.add("selected");
+
+      var state = node.dataset.nodeState || "";
+      var stateClass = state.toLowerCase();
+      document.getElementById("pipeline-node-title").textContent = node.dataset.nodeTitle || "Pipeline node";
+      document.getElementById("pipeline-node-detail").textContent = node.dataset.nodeDetail || "";
+
+      var stateBadge = document.getElementById("pipeline-node-state");
+      stateBadge.textContent = state || "Unknown";
+      stateBadge.className = "badge";
+      if (stateClass === "complete") stateBadge.classList.add("good");
+      else if (stateClass === "running") stateBadge.classList.add("warn");
+      else if (stateClass === "failed") stateBadge.classList.add("bad");
+    }
+
+    document.querySelectorAll(".pipeline-step[data-node-title]").forEach(function(node) {
+      node.addEventListener("mouseenter", function() { setPipelineInspector(node); });
+      node.addEventListener("focus", function() { setPipelineInspector(node); });
+      node.addEventListener("click", function() { setPipelineInspector(node); });
+      node.addEventListener("keydown", function(event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          setPipelineInspector(node);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

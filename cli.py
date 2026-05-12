@@ -5,6 +5,7 @@ import os
 import sys
 import uuid
 import warnings
+import webbrowser
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -62,10 +63,186 @@ from rich.table import Table
 from state import Stage01State
 from utilis.db import config, get_connection
 from utilis.logger import logger
-from utilis.db import get_pending_items, update_hitl_item, get_completed_items
+from utilis.db import get_pending_items, update_hitl_items_batch, get_completed_items
 from rich.prompt import Prompt
 from rich import print as rprint
-from nodes.hitl import hitl_review_node
+from nodes.hitl import hitl_review_node, build_hitl_enrichment_review_node
+def list_pending_enrichment_reviews() -> List[str]:
+    db_schema = config["azure_sql"]["schema_name"]
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT DISTINCT run_id
+            FROM [{db_schema}].[ai_store]
+            WHERE artifact_type = 'ENRICHED_METADATA'
+            AND run_id NOT IN (
+                SELECT run_id FROM [{db_schema}].[ai_store] WHERE artifact_type = 'GATE3_APPROVED_ENRICHMENT'
+            )
+            ORDER BY run_id
+            """
+        )
+        return [row.run_id for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+def fetch_enriched_metadata(run_id: str) -> dict:
+    db_schema = config["azure_sql"]["schema_name"]
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT TOP 1 payload
+            FROM [{db_schema}].[ai_store]
+            WHERE run_id = ? AND artifact_type = 'ENRICHED_METADATA'
+            ORDER BY stored_at DESC
+        """, (run_id,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return {}
+        return json.loads(row[0])
+    finally:
+        conn.close()
+
+
+def fetch_gate2_certified_tables(run_id: str) -> List[Dict[str, Any]]:
+    db_schema = config["azure_sql"]["schema_name"]
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT TOP 1 payload
+            FROM [{db_schema}].[ai_store]
+            WHERE run_id = ? AND artifact_type = 'GATE2_CERTIFIED_TABLES'
+            ORDER BY stored_at DESC
+            """,
+            (run_id,),
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return []
+        payload = json.loads(row[0])
+        return payload.get("certified_tables", []) or []
+    finally:
+        conn.close()
+
+def print_enrichment_review_panel(metadata: dict):
+    columns = metadata.get("columns", [])
+    joins = metadata.get("joins", [])
+    console.print(Panel(f"[bold]{len(columns)}[/] columns enriched\n[bold]{len(joins)}[/] joins suggested", title="Semantic Enrichment Review", border_style="bright_blue"))
+    table = Table(title="Columns for Review", show_lines=True)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Column", style="cyan")
+    table.add_column("Semantic Type", style="magenta")
+    table.add_column("PII", style="yellow")
+    table.add_column("Join Key", style="green")
+    for idx, col in enumerate(columns, 1):
+        table.add_row(
+            str(idx),
+            col.get("column_name", "N/A"),
+            col.get("semantic_type", "UNKNOWN"),
+            str(col.get("is_pii", False)),
+            str(col.get("is_join_key", False)),
+        )
+    console.print(table)
+    if joins:
+        jt = Table(title="Join Suggestions", show_lines=True)
+        jt.add_column("#", style="dim", width=4)
+        jt.add_column("Left Table", style="cyan")
+        jt.add_column("Left Col", style="white")
+        jt.add_column("Right Table", style="cyan")
+        jt.add_column("Right Col", style="white")
+        for idx, join in enumerate(joins, 1):
+            jt.add_row(
+                str(idx),
+                join.get("left_table", "N/A"),
+                join.get("left_column", "N/A"),
+                join.get("right_table", "N/A"),
+                join.get("right_column", "N/A"),
+            )
+        console.print(jt)
+
+
+def open_bronze_ui(ui_path: str) -> bool:
+    if not ui_path or not os.path.exists(ui_path):
+        return False
+
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(ui_path)
+        else:
+            webbrowser.open(f"file://{os.path.abspath(ui_path)}")
+        return True
+    except Exception as exc:
+        logger.warning("Could not open bronze UI automatically: %s", exc, extra={"node": "cli", "ui_path": ui_path})
+        return False
+
+def review_enrichment(run_id: str):
+    """Gate 3 — Interactive enrichment review."""
+    enrichment_node = build_hitl_enrichment_review_node()
+    from nodes.bronze_gen import bronze_code_generation_node
+    metadata = fetch_enriched_metadata(run_id)
+    if not metadata:
+        console.print(Panel("No enrichment metadata found.", title="Gate 3", border_style="yellow"))
+        return
+    print_enrichment_review_panel(metadata)
+    # Prompt for review
+    approve = Confirm.ask("Approve all semantic tags, PII, and join keys?", default=True)
+    state = {
+        "run_id": run_id,
+        "enriched_metadata": metadata,
+        "semantic_tags_reviewed": approve,
+        "pii_classifications_reviewed": approve,
+        "join_key_annotations_reviewed": approve,
+        "enrichment_review_decision": "APPROVED" if approve else "REJECTED",
+    }
+    result = enrichment_node(state)
+    if result.get("enrichment_review_status") == "COMPLETED":
+        console.print(Panel("[green]Gate 3 enrichment review complete and certified![/]", title="Gate 3", border_style="green"))
+        checkpoint_state = load_checkpoint_state(run_id) or {}
+        certified_tables = fetch_gate2_certified_tables(run_id)
+        if not certified_tables:
+            certified_tables = metadata.get("certified_tables") or checkpoint_state.get("certified_tables") or []
+        if not certified_tables:
+            console.print(Panel(
+                "Bronze generation skipped: no Gate 2 certified tables found in ai_store or checkpoint.",
+                title="Bronze Generation Skipped",
+                border_style="yellow",
+            ))
+            return
+        bronze_state = {
+            "run_id": run_id,
+            "fingerprint": metadata.get("fingerprint") or checkpoint_state.get("fingerprint") or run_id,
+            "certified_tables": certified_tables,
+            "bronze_catalog": os.getenv("BRONZE_CATALOG", "main"),
+            "bronze_schema": os.getenv("BRONZE_SCHEMA", "bronze"),
+        }
+        bronze_result = bronze_code_generation_node(bronze_state)
+        bronze_status = bronze_result.get("bronze_generation_status", "-")
+        generated = bronze_result.get("bronze_generation_results", []) or []
+        first_path = next((item.get("script_path") for item in generated if item.get("script_path")), None)
+        bundle_path = bronze_result.get("bronze_generation_bundle_path")
+        ui_path = bronze_result.get("bronze_generation_ui_path") or os.path.join(os.getcwd(), "generated_code", "bronze", "index.html")
+        bronze_error = bronze_result.get("bronze_generation_error")
+        ui_opened = False
+        if str(bronze_status).startswith("COMPLETED"):
+            ui_opened = open_bronze_ui(str(ui_path))
+        console.print(Panel(
+            f"Bronze Generation: {bronze_status}\n"
+            f"Scripts: {len(generated)}\n"
+            f"Output: {first_path or os.path.join(os.getcwd(), 'generated_code', 'bronze')}\n"
+            f"Viewer: {ui_path}\n"
+            f"JSON Bundle: {bundle_path or os.path.join(os.getcwd(), 'generated_code', 'bronze', 'bronze_scripts.json')}\n"
+            f"Detail: {bronze_error or ('Opened bronze viewer.' if ui_opened else 'OK')}",
+            title="Bronze Script Generation",
+            border_style="green" if str(bronze_status).startswith("COMPLETED") else "yellow",
+        ))
+    elif result.get("enrichment_review_status") == "FAILED":
+        console.print(Panel("[red]Gate 3 enrichment review rejected.[/]", title="Gate 3", border_style="red"))
+    else:
+        console.print(Panel("[yellow]Gate 3 enrichment review pending.[/]", title="Gate 3", border_style="yellow"))
 
 
 console = Console()
@@ -301,6 +478,7 @@ def print_metadata_discovery_summary(result: Dict[str, Any]) -> None:
     table.add_column("Table", style="cyan")
     table.add_column("Status", style="white")
     table.add_column("Columns", justify="right", style="green")
+    table.add_column("Error", style="red")
 
     for idx, item in enumerate(tables, 1):
         status = str(item.get("table_status", "UNKNOWN"))
@@ -312,6 +490,7 @@ def print_metadata_discovery_summary(result: Dict[str, Any]) -> None:
             str(item.get("table_name", "N/A")),
             f"[{status_style}]{status}[/{status_style}]",
             str(item.get("column_count", 0)),
+            str(item.get("error", "-"))[:70],
         )
 
     console.print(table)
@@ -462,25 +641,31 @@ def review_tables(run_id: str, cfg: Optional[Dict[str, Any]] = None):
 
     from nodes.metadata_discovery import metadata_discovery_node
     from nodes.column_profiling import column_profiling_node
+    from nodes.semantic_enrichment import semantic_enrichment_node
 
     discovered = metadata_discovery_node(resumed)
     profiled = column_profiling_node(discovered)
+    enriched = semantic_enrichment_node(profiled)
 
     console.print(Panel(
         f"[bold green]Gate 2 Complete[/]\n\n"
-        f"Status: {profiled.get('column_profiling_status', profiled.get('metadata_status', 'GATE2_COMPLETE'))}\n"
+        f"Status: {enriched.get('semantic_enrichment_status', enriched.get('column_profiling_status', enriched.get('metadata_status', 'GATE2_COMPLETE')))}\n"
         f"Certified Tables: {len(approved)}\n"
-        f"Metadata: {profiled.get('metadata_status', '-')}\n"
-        f"Column Profiling: {profiled.get('column_profiling_status', '-')}",
+        f"Metadata: {enriched.get('metadata_status', '-')}\n"
+        f"Column Profiling: {enriched.get('column_profiling_status', '-')}\n"
+        f"Semantic Enrichment: {enriched.get('semantic_enrichment_status', '-')}",
         title="🎉 HITL Table Certification",
         border_style="green",
     ))
 
     if sys.stdin.isatty():
         if ask_yes_no("Show metadata discovery summary?", default=False):
-            print_metadata_discovery_summary(profiled)
+            print_metadata_discovery_summary(enriched)
         if ask_yes_no("Show column profiling summary?", default=False):
-            print_column_profiling_summary(profiled)
+            print_column_profiling_summary(enriched)
+        if enriched.get("semantic_enrichment_status") == "COMPLETED":
+            if ask_yes_no("Start Gate 3 enrichment review now?", default=True):
+                review_enrichment(run_id)
 
     return True
 
@@ -576,6 +761,7 @@ def review_run(run_id: str, gate: int = 1, cfg: Optional[Dict[str, Any]] = None)
     print_pending_kpis(pending)
 
     reviewed_items: List[Dict[str, Any]] = []
+    batch_updates: List[Dict[str, Optional[str]]] = []
 
     for item in pending:
         console.print(f"\n[bold yellow]Review {item['item_id']}[/]")
@@ -585,7 +771,12 @@ def review_run(run_id: str, gate: int = 1, cfg: Optional[Dict[str, Any]] = None)
         action = Prompt.ask("[A]pprove [R]eject [E]dit", choices=["A", "R", "E"], default="A").upper()
         
         if action == "A":
-            update_hitl_item(item["item_id"], "APPROVED")
+            batch_updates.append({
+                "item_id": item["item_id"],
+                "status": "APPROVED",
+                "edited_content": None,
+                "rejection_reason": None,
+            })
             console.print("[green]✅ Approved[/]")
             reviewed_items.append({
                 "kpi_name": kpi.get("kpi_name", "N/A"),
@@ -595,7 +786,12 @@ def review_run(run_id: str, gate: int = 1, cfg: Optional[Dict[str, Any]] = None)
             })
         elif action == "R":
             reason = Prompt.ask("Reason")
-            update_hitl_item(item["item_id"], "REJECTED", rejection_reason=reason)
+            batch_updates.append({
+                "item_id": item["item_id"],
+                "status": "REJECTED",
+                "edited_content": None,
+                "rejection_reason": reason,
+            })
             console.print("[red]❌ Rejected[/]")
             reviewed_items.append({
                 "kpi_name": kpi.get("kpi_name", "N/A"),
@@ -609,7 +805,12 @@ def review_run(run_id: str, gate: int = 1, cfg: Optional[Dict[str, Any]] = None)
             edited = kpi.copy()
             edited["kpi_name"] = name
             edited["kpi_description"] = desc
-            update_hitl_item(item["item_id"], "APPROVED", json.dumps(edited))
+            batch_updates.append({
+                "item_id": item["item_id"],
+                "status": "APPROVED",
+                "edited_content": json.dumps(edited),
+                "rejection_reason": None,
+            })
             console.print("[blue]✏️ Edited/Approved[/]")
             reviewed_items.append({
                 "kpi_name": name,
@@ -617,6 +818,8 @@ def review_run(run_id: str, gate: int = 1, cfg: Optional[Dict[str, Any]] = None)
                 "confidence": kpi.get("ai_confidence_score", 0),
                 "reason": None,
             })
+
+    update_hitl_items_batch(batch_updates)
 
     remaining = get_pending_items(run_id, gate)
     if remaining:
