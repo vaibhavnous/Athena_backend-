@@ -1,12 +1,4 @@
-"""
-NB10 — Bronze Code Generation (POC MODE)
 
-Assumptions:
-- Single client
-- Source DB: insurance (hard-coded)
-- No discovery dependency
-- Scripts are executed externally on Spark / Databricks
-"""
 
 from __future__ import annotations
 
