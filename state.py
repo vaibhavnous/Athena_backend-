@@ -59,6 +59,7 @@ class Stage01State(TypedDict, total=False):
     # ── Stage 04: Semantic Search (NEW) ────────────────────
     semantic_matches: Optional[List[Dict]]   # raw vector matches
     semantic_top_k: Optional[int]            # number of matches fetched
+    keyword_expansions: Optional[Dict[str, List[str]]]
 
     # ── Stage 04: Table Nomination outputs ─────────────────
     nominated_tables: Optional[List[Dict]]
@@ -88,8 +89,6 @@ class Stage01State(TypedDict, total=False):
 
     # —— Bronze Code Generation ————————————————————————————————————————————————
     source_jdbc_url: Optional[str]
-    source_type: Optional[str]
-    sftp_source: Optional[Dict[str, Any]]
     bronze_catalog: Optional[str]
     bronze_schema: Optional[str]
     bronze_generation_status: Optional[str]  # 'PENDING' | 'COMPLETED' | 'FAILED' | 'SKIPPED'

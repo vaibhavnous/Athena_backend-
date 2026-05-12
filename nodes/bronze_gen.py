@@ -9,6 +9,9 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, TypedDict
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from nodes.req_extraction import get_llm
 from state import Stage01State
 from utilis.db import build_source_jdbc_url
 from utilis.logger import logger
@@ -19,6 +22,12 @@ from utilis.logger import logger
 # ------------------------------------------------------------------------------
 
 BRONZE_MAX_WORKERS = int(os.environ.get("BRONZE_MAX_WORKERS", "4"))
+BRONZE_LLM_MAX_PROMPT_CHARS = int(os.environ.get("BRONZE_LLM_MAX_PROMPT_CHARS", "45000"))
+BRONZE_LLM_TIMEOUT_SECONDS = int(os.environ.get("BRONZE_LLM_TIMEOUT_SECONDS", "60"))
+BRONZE_LLM_SYSTEM_MSG = (
+    "You are a senior Spark data engineer. Return only production-ready Python code. "
+    "Do not include markdown fences or explanations."
+)
 
 DANGEROUS_SQL_KEYWORDS = {
     "DELETE",
@@ -33,18 +42,6 @@ class BronzeTableRef(TypedDict):
     database_name: str
     schema_name: str
     table_name: str
-
-
-class SftpSourceConfig(TypedDict, total=False):
-    source_name: str
-    folder: str
-    file_pattern: str
-    entity: str
-    frequency: str
-    mandatory_columns: List[str]
-    expected_row_count: int
-    checksum: str
-    checksum_algorithm: str
 
 
 def _normalize_bronze_column_name(column_name: str) -> str:
@@ -93,6 +90,13 @@ def _cast_rules_for_table(state: Stage01State, table_name: str) -> Dict[str, str
                 rules[column_name] = cast_type
         break
     return rules
+
+
+def _metadata_for_table(state: Stage01State, table_name: str) -> Dict[str, Any]:
+    for table in _metadata_tables(state):
+        if str(table.get("table_name") or "").lower() == table_name.lower():
+            return table
+    return {}
 
 
 # ------------------------------------------------------------------------------
@@ -153,6 +157,82 @@ def _detect_dangerous_sql(code: str) -> None:
     for kw in DANGEROUS_SQL_KEYWORDS:
         if f"{kw} " in upper:
             raise ValueError(f"Dangerous SQL keyword detected: {kw}")
+
+
+def _strip_code_fences(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
+    return raw
+
+
+def _llm_enabled_for_bronze() -> bool:
+    return os.getenv("ATHENA_ENABLE_LLM_BRONZE_ENHANCEMENT", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def _enhance_with_llm(code: str, metadata: Dict[str, Any]) -> str:
+    provider = os.getenv("ATHENA_LLM_PROVIDER", "azure_openai")
+    model = os.getenv("ATHENA_BRONZE_LLM_MODEL")
+    llm = get_llm(
+        provider=provider,
+        model=model,
+        temperature=0.0,
+        request_timeout=BRONZE_LLM_TIMEOUT_SECONDS,
+    )
+
+    prompt = f"""
+Enhance this deterministic Spark Bronze ingestion script.
+
+Metadata:
+{json.dumps(metadata, indent=2, default=str)}
+
+Requirements:
+- Preserve the same source table and target table.
+- Preserve JDBC loading and Delta append behavior.
+- Normalize column names deterministically.
+- Improve safe casts, date parsing, null handling, and ingestion metadata where metadata supports it.
+- Add concise comments only where they clarify non-obvious logic.
+- Do not generate DELETE, UPDATE, MERGE, TRUNCATE, or ALTER statements.
+- Do not remove existing validation behavior.
+- Return only a complete Python script.
+
+Current script:
+{code}
+""".strip()
+
+    if len(prompt) > BRONZE_LLM_MAX_PROMPT_CHARS:
+        raise ValueError(
+            f"Bronze LLM enhancement prompt too large: {len(prompt)} chars > {BRONZE_LLM_MAX_PROMPT_CHARS}"
+        )
+
+    response = llm.invoke(
+        [
+            SystemMessage(content=BRONZE_LLM_SYSTEM_MSG),
+            HumanMessage(content=prompt),
+        ]
+    )
+    enhanced = _strip_code_fences(str(response.content))
+    if not enhanced:
+        raise ValueError("Bronze LLM enhancement returned empty code")
+    return enhanced
+
+
+def _maybe_enhance_with_llm(code: str, metadata: Dict[str, Any]) -> tuple[str, bool, str | None]:
+    if not _llm_enabled_for_bronze():
+        return code, False, None
+
+    try:
+        enhanced = _enhance_with_llm(code, metadata)
+        _validate_python(enhanced)
+        _detect_dangerous_sql(enhanced)
+        return enhanced, True, None
+    except Exception as exc:
+        logger.warning(
+            "Bronze LLM enhancement failed; using deterministic template: %s",
+            exc,
+            extra={"node": "bronze_gen", "pass": "llm_enhancement"},
+        )
+        return code, False, str(exc)[:500]
 
 
 def _write_bronze_readme(
@@ -591,154 +671,6 @@ spark.sql(create_table_sql)
 
 print(f"SUCCESS: Bronze ingestion completed for {{TARGET_TABLE}}")
 '''
-
-
-def generate_sftp_bronze_script(
-    *,
-    source: SftpSourceConfig,
-    bronze_catalog: str = "main",
-    bronze_schema: str = "bronze",
-) -> str:
-    entity = str(source.get("entity") or "transaction").strip() or "transaction"
-    table_name = entity.lower().replace(" ", "_")
-    folder = str(source.get("folder") or "/daily/transactions/").strip()
-    file_pattern = str(source.get("file_pattern") or "TXN_YYYYMMDD.csv").strip()
-    source_name = str(source.get("source_name") or "Vendor SFTP").strip()
-    mandatory_columns = [str(column).strip() for column in source.get("mandatory_columns", []) if str(column).strip()]
-    expected_row_count = source.get("expected_row_count")
-    checksum = str(source.get("checksum") or "").strip()
-    checksum_algorithm = str(source.get("checksum_algorithm") or "sha256").strip().lower()
-
-    return f'''
-"""
-AUTO-GENERATED BRONZE INGESTION SCRIPT
-
-Source: {source_name}
-Folder: {folder}
-File pattern: {file_pattern}
-Expected runtime: Spark / Databricks with Delta support and paramiko installed
-Target table: {bronze_catalog}.{bronze_schema}.bronze_{table_name}
-
-DO NOT EDIT MANUALLY
-"""
-
-import hashlib
-import os
-from pathlib import Path
-
-import paramiko
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import current_timestamp, input_file_name, lit
-
-spark = SparkSession.builder.getOrCreate()
-
-try:
-    spark.sql("CREATE SCHEMA IF NOT EXISTS {bronze_schema}")
-except Exception:
-    print("Could not create schema '{bronze_schema}' in the current catalog")
-
-RUN_ID = os.getenv("ATHENA_RUN_ID", "BRONZE_POC_RUN_001")
-SFTP_HOST = os.environ["SFTP_HOST"]
-SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
-SFTP_USERNAME = os.environ["SFTP_USERNAME"]
-SFTP_PASSWORD = os.getenv("SFTP_PASSWORD")
-SFTP_PRIVATE_KEY_PATH = os.getenv("SFTP_PRIVATE_KEY_PATH")
-
-REMOTE_FOLDER = "{folder}"
-FILE_PATTERN = "{file_pattern}"
-FILE_NAME = FILE_PATTERN.replace("YYYYMMDD", os.getenv("INGESTION_DATE", ""))
-if not FILE_NAME or "YYYYMMDD" in FILE_NAME:
-    from datetime import datetime
-    FILE_NAME = FILE_PATTERN.replace("YYYYMMDD", datetime.utcnow().strftime("%Y%m%d"))
-
-REMOTE_PATH = REMOTE_FOLDER.rstrip("/") + "/" + FILE_NAME
-LOCAL_DIR = Path(os.getenv("SFTP_LOCAL_DIR", f"/dbfs/tmp/athena_sftp/{{RUN_ID}}"))
-LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-LOCAL_PATH = LOCAL_DIR / FILE_NAME
-SPARK_CSV_PATH = str(LOCAL_PATH)
-if SPARK_CSV_PATH.startswith("/dbfs/"):
-    SPARK_CSV_PATH = "dbfs:/" + SPARK_CSV_PATH[len("/dbfs/"):]
-
-TARGET_TABLE = "{bronze_schema}.bronze_{table_name}"
-MANDATORY_COLUMNS = {repr(mandatory_columns)}
-EXPECTED_ROW_COUNT = {repr(expected_row_count)}
-EXPECTED_CHECKSUM = os.getenv("EXPECTED_CHECKSUM", {repr(checksum or None)})
-CHECKSUM_ALGORITHM = "{checksum_algorithm}"
-
-def _open_sftp():
-    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-    if SFTP_PRIVATE_KEY_PATH:
-        key = paramiko.RSAKey.from_private_key_file(SFTP_PRIVATE_KEY_PATH)
-        transport.connect(username=SFTP_USERNAME, pkey=key)
-    else:
-        if not SFTP_PASSWORD:
-            raise ValueError("Set SFTP_PASSWORD or SFTP_PRIVATE_KEY_PATH.")
-        transport.connect(username=SFTP_USERNAME, password=SFTP_PASSWORD)
-    return transport, paramiko.SFTPClient.from_transport(transport)
-
-def _file_checksum(path):
-    digest = hashlib.new(CHECKSUM_ALGORITHM)
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-transport, sftp = _open_sftp()
-try:
-    sftp.get(REMOTE_PATH, str(LOCAL_PATH))
-finally:
-    sftp.close()
-    transport.close()
-
-actual_checksum = _file_checksum(LOCAL_PATH)
-if EXPECTED_CHECKSUM and actual_checksum.lower() != EXPECTED_CHECKSUM.lower():
-    raise ValueError(
-        f"Checksum mismatch for {{REMOTE_PATH}}: expected={{EXPECTED_CHECKSUM}}, actual={{actual_checksum}}"
-    )
-
-df = (
-    spark.read
-    .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(SPARK_CSV_PATH)
-)
-
-normalized_columns = [column.strip().lower() for column in df.columns]
-df = df.toDF(*normalized_columns)
-
-missing_columns = [column.lower() for column in MANDATORY_COLUMNS if column.lower() not in df.columns]
-if missing_columns:
-    raise ValueError(f"Missing mandatory columns in {{REMOTE_PATH}}: {{missing_columns}}")
-
-actual_row_count = df.count()
-if EXPECTED_ROW_COUNT is not None and actual_row_count != EXPECTED_ROW_COUNT:
-    raise ValueError(
-        f"Row count mismatch for {{REMOTE_PATH}}: expected={{EXPECTED_ROW_COUNT}}, actual={{actual_row_count}}"
-    )
-
-df = (
-    df
-    .withColumn("run_id", lit(RUN_ID))
-    .withColumn("ingestion_timestamp", current_timestamp())
-    .withColumn("source_system", lit("{source_name}"))
-    .withColumn("source_folder", lit(REMOTE_FOLDER))
-    .withColumn("source_file", input_file_name())
-    .withColumn("source_checksum", lit(actual_checksum))
-    .withColumn("source_row_count", lit(actual_row_count))
-)
-
-(
-    df.write
-    .format("delta")
-    .mode("append")
-    .option("mergeSchema", "true")
-    .saveAsTable(TARGET_TABLE)
-)
-
-print(f"SUCCESS: SFTP Bronze ingestion completed for {{TARGET_TABLE}} from {{REMOTE_PATH}}")
-'''
-
-
 # ------------------------------------------------------------------------------
 # PER-TABLE GENERATION
 # ------------------------------------------------------------------------------
@@ -750,6 +682,7 @@ def _generate_one_table(
     bronze_catalog: str = "main",
     bronze_schema: str = "bronze",
     cast_rules: Dict[str, str] | None = None,
+    table_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, object]:
     database_name = table_ref["database_name"]
     schema_name = table_ref["schema_name"]
@@ -765,6 +698,14 @@ def _generate_one_table(
         source_jdbc_url=resolved_source_jdbc_url,
         cast_rules=cast_rules or {},
     )
+
+    enhancement_metadata = {
+        "source_table": table_ref,
+        "target_table": f"{bronze_catalog}.{bronze_schema}.bronze_{table_name}",
+        "cast_rules": cast_rules or {},
+        "table_metadata": table_metadata or {},
+    }
+    code, llm_enhanced, llm_error = _maybe_enhance_with_llm(code, enhancement_metadata)
 
     _validate_python(code)
     _detect_dangerous_sql(code)
@@ -783,47 +724,10 @@ def _generate_one_table(
         "schema_name": schema_name,
         "status": "APPROVED",
         "cast_rule_count": len(cast_rules or {}),
+        "llm_enhanced": llm_enhanced,
+        "llm_enhancement_error": llm_error,
         "script_path": script_path,
     }
-
-
-def _generate_sftp_source(
-    *,
-    source: SftpSourceConfig,
-    bronze_catalog: str = "main",
-    bronze_schema: str = "bronze",
-) -> Dict[str, object]:
-    entity = str(source.get("entity") or "transaction").strip() or "transaction"
-    table_name = entity.lower().replace(" ", "_")
-
-    code = generate_sftp_bronze_script(
-        source=source,
-        bronze_catalog=bronze_catalog,
-        bronze_schema=bronze_schema,
-    )
-
-    _validate_python(code)
-    _detect_dangerous_sql(code)
-
-    output_dir = _bronze_output_dir()
-    os.makedirs(output_dir, exist_ok=True)
-
-    script_path = os.path.join(output_dir, f"bronze_ingest_sftp_{table_name}.py")
-
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(code)
-
-    return {
-        "table": table_name,
-        "database_name": str(source.get("source_name") or "Vendor SFTP"),
-        "schema_name": str(source.get("folder") or "/daily/transactions/"),
-        "source_type": "sftp",
-        "file_pattern": str(source.get("file_pattern") or "TXN_YYYYMMDD.csv"),
-        "status": "APPROVED",
-        "script_path": script_path,
-    }
-
-
 # ------------------------------------------------------------------------------
 # LANGGRAPH NODE
 # ------------------------------------------------------------------------------
@@ -839,50 +743,30 @@ def bronze_code_generation_node(state: Stage01State) -> Stage01State:
     bronze_catalog = state.get("bronze_catalog") or "main"
     bronze_schema = state.get("bronze_schema") or "bronze"
 
-    if str(state.get("source_type") or "").lower() == "sftp":
-        sftp_source = state.get("sftp_source") or {}
-        if not isinstance(sftp_source, dict):
-            new_state["bronze_generation_status"] = "FAILED"
-            new_state["bronze_generation_error"] = "sftp_source must be a dictionary."
-            return new_state
-        results.append(
-            _generate_sftp_source(
-                source=sftp_source,
+    table_refs = _resolve_tables_for_bronze(state)
+
+    if not table_refs:
+        new_state["bronze_generation_status"] = "SKIPPED"
+        new_state["bronze_generation_error"] = "No certified_tables or nominated_tables available for Bronze generation."
+        return new_state
+
+    source_jdbc_url = state.get("source_jdbc_url")
+    with ThreadPoolExecutor(max_workers=BRONZE_MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(
+                _generate_one_table,
+                table_ref,
+                source_jdbc_url=source_jdbc_url,
                 bronze_catalog=bronze_catalog,
                 bronze_schema=bronze_schema,
+                cast_rules=_cast_rules_for_table(state, table_ref["table_name"]),
+                table_metadata=_metadata_for_table(state, table_ref["table_name"]),
             )
-        )
-        table_refs = [
-            {
-                "database_name": str(sftp_source.get("source_name") or "Vendor SFTP"),
-                "schema_name": str(sftp_source.get("folder") or "/daily/transactions/"),
-                "table_name": str(sftp_source.get("entity") or "transaction").lower().replace(" ", "_"),
-            }
+            for table_ref in table_refs
         ]
-    else:
-        table_refs = _resolve_tables_for_bronze(state)
 
-        if not table_refs:
-            new_state["bronze_generation_status"] = "SKIPPED"
-            new_state["bronze_generation_error"] = "No certified_tables or nominated_tables available for Bronze generation."
-            return new_state
-
-        source_jdbc_url = state.get("source_jdbc_url")
-        with ThreadPoolExecutor(max_workers=BRONZE_MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(
-                    _generate_one_table,
-                    table_ref,
-                    source_jdbc_url=source_jdbc_url,
-                    bronze_catalog=bronze_catalog,
-                    bronze_schema=bronze_schema,
-                    cast_rules=_cast_rules_for_table(state, table_ref["table_name"]),
-                )
-                for table_ref in table_refs
-            ]
-
-            for f in as_completed(futures):
-                results.append(f.result())
+        for f in as_completed(futures):
+            results.append(f.result())
 
     # Write bundle summary
     bundle = {

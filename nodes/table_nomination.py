@@ -10,16 +10,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from typing import Any, Callable, Dict, List, Set
 
 from langgraph.graph import StateGraph
+from langchain_core.messages import HumanMessage, SystemMessage
 from pinecone import Pinecone
 
 from nodes.ingestion import _embedding_model
+from nodes.req_extraction import get_llm
 from schema import NominationItem, NominationSchema
 from state import Stage01State
 from utilis.db import (
     ai_store_db_writer,
+    artifact_storage_fingerprint,
     config as db_config,
     execute_source_sql,
     get_client_connection,
@@ -55,6 +59,12 @@ SYNONYMS: Dict[str, List[str]] = {
     "identifier": ["identifier", "id", "key", "reference"],
 }
 
+KEYWORD_EXPANSION_SYSTEM_MSG = (
+    "You expand KPI search keywords for schema discovery. "
+    "Return only valid JSON. Do not include markdown fences or explanation."
+)
+KEYWORD_EXPANSION_ARTIFACT_TYPE = "KEYWORD_EXPANSIONS"
+
 
 def _extract_kpi_names(certified_kpis: List[Any]) -> List[str]:
     names: List[str] = []
@@ -89,12 +99,216 @@ def _tokenize_identifier(text: str) -> List[str]:
     return [token for token in normalized.split("_") if token]
 
 
-def _expand_keywords(keywords: List[str]) -> Dict[str, Set[str]]:
+def _static_expand_keywords(keywords: List[str]) -> Dict[str, Set[str]]:
     expanded: Dict[str, Set[str]] = {}
     for keyword in keywords:
         variants = set(SYNONYMS.get(keyword, [keyword]))
         variants.add(keyword)
         expanded[keyword] = {_normalize(variant) for variant in variants if variant}
+    return expanded
+
+
+def _strip_fences(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
+    return raw
+
+
+def _keyword_expansion_fingerprint(kpi_names: List[str], keywords: List[str]) -> str:
+    canonical = {
+        "kpi_names": sorted({str(name).strip().lower() for name in kpi_names if str(name).strip()}),
+        "keywords": sorted({str(keyword).strip().lower() for keyword in keywords if str(keyword).strip()}),
+    }
+    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_keyword_expansion_cache(cache_fingerprint: str) -> Dict[str, Set[str]] | None:
+    conn = get_pipeline_connection()
+    try:
+        cursor = conn.cursor()
+        schema = (
+            db_config.get("azure_sql", {}).get("pipeline_schema")
+            or db_config.get("azure_sql", {}).get("schema_name")
+            or "dbo"
+        )
+        storage_fingerprint = artifact_storage_fingerprint(cache_fingerprint, KEYWORD_EXPANSION_ARTIFACT_TYPE)
+        cursor.execute(
+            f"""
+            SELECT TOP 1 payload
+            FROM [{schema}].[ai_store]
+            WHERE fingerprint = ? AND artifact_type = ?
+            ORDER BY stored_at DESC
+            """,
+            (storage_fingerprint, KEYWORD_EXPANSION_ARTIFACT_TYPE),
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+
+        payload = json.loads(row[0])
+        raw_expansions = payload.get("keyword_expansions")
+        if not isinstance(raw_expansions, dict):
+            return None
+
+        cached: Dict[str, Set[str]] = {}
+        for keyword, variants in raw_expansions.items():
+            if not isinstance(keyword, str):
+                continue
+            if not isinstance(variants, list):
+                continue
+            normalized = {_normalize(keyword)}
+            normalized.update(
+                _normalize(variant)
+                for variant in variants
+                if isinstance(variant, str) and variant.strip()
+            )
+            cached[_normalize(keyword)] = {variant for variant in normalized if variant}
+        return cached
+    except Exception as exc:
+        logger.warning(
+            "Keyword expansion cache read failed: %s",
+            exc,
+            extra={"node": "table_nomination", "pass": "keyword_expansion_cache"},
+        )
+        return None
+    finally:
+        conn.close()
+
+
+def _save_keyword_expansion_cache(
+    cache_fingerprint: str,
+    kpi_names: List[str],
+    expanded_keywords: Dict[str, Set[str]],
+) -> None:
+    payload = {
+        "fingerprint": cache_fingerprint,
+        "kpi_names": kpi_names,
+        "keyword_expansions": {
+            keyword: sorted(list(variants))
+            for keyword, variants in expanded_keywords.items()
+        },
+    }
+    ai_store_db_writer(
+        run_id=cache_fingerprint,
+        stage="Table Nomination",
+        artifact_type=KEYWORD_EXPANSION_ARTIFACT_TYPE,
+        payload=payload,
+        schema_version="KeywordExpansionCache_v1",
+        prompt_version="KEYWORD_EXPANSION_v1",
+        faithfulness_status="PASSED",
+        token_count=0,
+        input_tokens=0,
+        output_tokens=0,
+        fingerprint=cache_fingerprint,
+    )
+
+
+def _expand_keywords_llm(kpi_names: List[str], keywords: List[str]) -> Dict[str, Set[str]]:
+    if not keywords:
+        return {}
+
+    provider = os.getenv("ATHENA_LLM_PROVIDER", "azure_openai")
+    model = os.getenv("ATHENA_KEYWORD_EXPANSION_MODEL")
+    llm = get_llm(provider=provider, model=model, temperature=0.0)
+
+    prompt = f"""
+KPI names:
+{json.dumps(kpi_names, indent=2)}
+
+Base keywords:
+{json.dumps(keywords, indent=2)}
+
+Generate domain-relevant schema search variants for each base keyword.
+Return only valid JSON as an object mapping each base keyword to a list of variants.
+
+Rules:
+- Keep each list short: max 6 variants per keyword.
+- Prefer business and data-model terms that may appear in table or column names.
+- Do not invent unrelated concepts.
+- Include singular/plural, abbreviations, and close business synonyms when useful.
+- Keys must exactly match the provided base keywords.
+""".strip()
+
+    response = llm.invoke(
+        [
+            SystemMessage(content=KEYWORD_EXPANSION_SYSTEM_MSG),
+            HumanMessage(content=prompt),
+        ]
+    )
+
+    parsed = json.loads(_strip_fences(str(response.content)))
+    if not isinstance(parsed, dict):
+        raise ValueError("Keyword expansion response must be a JSON object")
+
+    expanded: Dict[str, Set[str]] = {}
+    for keyword in keywords:
+        raw_variants = parsed.get(keyword, [])
+        if raw_variants is None:
+            raw_variants = []
+        if not isinstance(raw_variants, list):
+            raise ValueError(f"Keyword expansion for {keyword!r} must be a list")
+
+        variants = {keyword}
+        variants.update(SYNONYMS.get(keyword, []))
+        for variant in raw_variants[:6]:
+            if isinstance(variant, str) and variant.strip():
+                variants.add(variant.strip())
+
+        expanded[keyword] = {_normalize(variant) for variant in variants if variant}
+
+    return expanded
+
+
+def _expand_keywords(kpi_names: List[str], keywords: List[str]) -> Dict[str, Set[str]]:
+    expanded = _static_expand_keywords(keywords)
+    if not keywords:
+        return expanded
+
+    use_llm = os.getenv("ATHENA_ENABLE_LLM_KEYWORD_EXPANSION", "true").lower() in {"1", "true", "yes", "on"}
+    if not use_llm:
+        return expanded
+
+    cache_fingerprint = _keyword_expansion_fingerprint(kpi_names, keywords)
+    cached = _load_keyword_expansion_cache(cache_fingerprint)
+    if cached:
+        for keyword, variants in cached.items():
+            expanded.setdefault(keyword, set()).update(variants)
+        logger.info(
+            "Keyword expansion cache hit for %d keywords",
+            len(cached),
+            extra={"node": "table_nomination", "pass": "keyword_expansion_cache"},
+        )
+        return expanded
+
+    try:
+        llm_expanded = _expand_keywords_llm(kpi_names, keywords)
+    except Exception as exc:
+        logger.warning(
+            "LLM keyword expansion failed, falling back to static synonyms: %s",
+            exc,
+            extra={"node": "table_nomination", "pass": "keyword_expansion"},
+        )
+        return expanded
+
+    for keyword, variants in llm_expanded.items():
+        expanded.setdefault(keyword, set()).update(variants)
+
+    try:
+        _save_keyword_expansion_cache(cache_fingerprint, kpi_names, expanded)
+    except Exception as exc:
+        logger.warning(
+            "Keyword expansion cache write failed: %s",
+            exc,
+            extra={"node": "table_nomination", "pass": "keyword_expansion_cache"},
+        )
+
+    logger.info(
+        "LLM keyword expansion completed for %d keywords",
+        len(llm_expanded),
+        extra={"node": "table_nomination", "pass": "keyword_expansion"},
+    )
     return expanded
 
 
@@ -166,12 +380,16 @@ def _best_match_weight(variants: Set[str], table_tokens: Set[str], column_tokens
     return best_weight, matched_in_column
 
 
-def _lexical_search(kpi_keywords: List[str], source_databases: List[str]) -> List[Dict[str, Any]]:
+def _lexical_search(
+    kpi_keywords: List[str],
+    source_databases: List[str],
+    expanded_keywords: Dict[str, Set[str]] | None = None,
+) -> List[Dict[str, Any]]:
     if not kpi_keywords or not source_databases:
         return []
 
     keyword_set = {kw.lower() for kw in kpi_keywords}
-    expanded_keywords = _expand_keywords(sorted(keyword_set))
+    expanded_keywords = expanded_keywords or _static_expand_keywords(sorted(keyword_set))
     domain_tokens: Set[str] = set()
     for variants in expanded_keywords.values():
         domain_tokens.update(variants)
@@ -632,10 +850,11 @@ def build_table_nomination_node() -> Callable[[Stage01State], Stage01State]:
         kpi_names = _extract_kpi_names(certified_kpis)
         keywords = _build_keywords(kpi_names)
         domain_tokens = {_normalize(token) for token in keywords}
-        for variants in _expand_keywords(keywords).values():
+        expanded_keywords = _expand_keywords(kpi_names, keywords)
+        for variants in expanded_keywords.values():
             domain_tokens.update(variants)
 
-        lexical_results = _lexical_search(keywords, source_databases)
+        lexical_results = _lexical_search(keywords, source_databases, expanded_keywords=expanded_keywords)
         semantic_results = _semantic_search("; ".join(kpi_names), source_databases)
         fused = _fuse_results(lexical_results, semantic_results, source_databases)
 
@@ -665,6 +884,7 @@ def build_table_nomination_node() -> Callable[[Stage01State], Stage01State]:
             "nominations": [n.model_dump(mode="json") for n in validated.nominations],
             "source_databases": source_databases,
             "kpi_names": kpi_names,
+            "keyword_expansions": {keyword: sorted(list(variants)) for keyword, variants in expanded_keywords.items()},
         }
         ai_store_db_writer(
             run_id=run_id,
@@ -690,6 +910,7 @@ def build_table_nomination_node() -> Callable[[Stage01State], Stage01State]:
                 "source_databases": source_databases,
                 "semantic_matches": semantic_results,
                 "semantic_top_k": len(semantic_results),
+                "keyword_expansions": {keyword: sorted(list(variants)) for keyword, variants in expanded_keywords.items()},
             }
         )
 
