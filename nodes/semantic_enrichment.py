@@ -1,5 +1,5 @@
 """
-NB09 — Semantic Enrichment Node
+ Semantic Enrichment Node
 
 Responsibilities:
 - Column semantic classification (rule-first, LLM optional)
