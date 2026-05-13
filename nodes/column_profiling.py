@@ -1,7 +1,7 @@
 """
 Deterministic column profiling node for LangGraph.
 
-Implements NB08-style column profiling using:
+Implements column profiling node using:
 - PASS 1: Full-table SQL pushdown statistics
 - PASS 2: Sampled distribution statistics (MEASURE only)
 
